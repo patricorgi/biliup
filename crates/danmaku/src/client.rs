@@ -678,7 +678,7 @@ fn platform_tls_connector() -> Result<Connector> {
     Ok(Connector::Rustls(Arc::new(config)))
 }
 
-async fn connect_websocket(
+pub async fn connect_websocket(
     conn_info: &ConnectionInfo,
     platform_name: &str,
 ) -> Result<

@@ -22,7 +22,7 @@ import {
   useFormState,
 } from '@douyinfe/semi-ui'
 import useSWR from 'swr'
-import { BiliType, fetcher, StudioEntity } from '../lib/api-streamer'
+import { BiliType, fetcher } from '../lib/api-streamer'
 import { useBiliUsers, useTypeTree } from '../lib/use-streamers'
 
 /** 把已保存的定时发布延迟 dtime(秒)换算成滚轮的「小时 / 分钟」;没有或不在可选范围内时用默认的 4 小时 0 分 */
@@ -37,11 +37,13 @@ function delayFromDtime(dtime: any): { hours: number; minutes: number } {
   return { hours: 4, minutes: 0 }
 }
 
-type TemplateFieldsProps = FormFCChild<StudioEntity & { isDtime: boolean }> & {
+type TemplateFieldsProps = FormFCChild & {
   /** 替换「投稿账号」一栏（Fleet 控制面按节点上报的 mid 选账号，而不是本机的凭据文件） */
   accountField?: React.ReactNode
   /** 分区树拉不到时（本机没有 B 站账号）改为直接填分区 ID，值是数字而不是 [父, 子] */
   plainTid?: boolean
+  submission?: boolean
+  coverField?: React.ReactNode
 }
 
 const TemplateFields: React.FC<TemplateFieldsProps> = ({
@@ -50,6 +52,8 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
   values,
   accountField,
   plainTid,
+  submission,
+  coverField,
 }) => {
   const {
     Section,
@@ -69,7 +73,7 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
   } = Form
   const { Text } = Typography
   const { typeTree, isError, isLoading } = useTypeTree()
-  const treeData = typeTree?.map((type: BiliType) => {
+  const treeData: { label: string; value: number; children: { label: React.ReactNode; value: number; name: string }[] }[] | undefined = typeTree?.map((type: BiliType) => {
     return {
       ...type,
       children: type.children.map(cType => {
@@ -83,6 +87,7 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
             </>
           ),
           value: cType.id,
+          name: cType.name,
         }
       }),
     }
@@ -109,7 +114,7 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
         label="互动设置"
       />
       <Input field="dynamic" label="粉丝动态" style={{ width: 464 }} />
-      <Form.Select
+      {!submission && <Form.Select
         field="uploader"
         label="上传插件"
         initValue={values.uploader ?? 'biliup-rs'}
@@ -119,7 +124,7 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
         <Form.Select.Option value="bili_web">bili_web</Form.Select.Option>
         <Form.Select.Option value="biliup-rs">biliup-rs</Form.Select.Option>
         <Form.Select.Option value="Noop">Noop</Form.Select.Option>
-      </Form.Select>
+      </Form.Select>}
       <Switch field="no_reprint" label="自制声明" />
       <Switch field="is_only_self" label="仅自己可见" />
       <Form.Switch field="charging_pay" label="开启充电面板" />
@@ -199,7 +204,7 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
 
   return (
     <>
-      <Section text={'基本信息'}>
+      {!submission && <Section text={'基本信息'}>
         <Input
           rules={[{ required: true }]}
           field="template_name"
@@ -215,14 +220,15 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
             optionList={list}
           />
         )}
-      </Section>
+      </Section>}
       <Section text={'基本设置'}>
         <Input
           field="title"
           label="视频标题"
           style={{ width: 464 }}
           placeholder="稿件标题"
-          extraText={
+          rules={submission ? [{ required: true, message: '请填写稿件标题' }] : undefined}
+          extraText={!submission && (
             <div style={{ fontSize: 14 }}>
               {'\u007B'}streamer{'\u007D'}: 录播备注
               <br />
@@ -230,14 +236,14 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
               <br />
               %Y-%m-%d %H_%M_%S: 开始录制时的 年-月-日 时_分_秒
             </div>
-          }
+          )}
         />
         <RadioGroup
           field="copyright"
           label="类型"
           direction="vertical"
           initValue={formApi.getValue('copyright') ?? 2}
-          extraText={<div style={{ fontSize: 14 }}>如不填写转载来源默认为直播间地址</div>}
+          extraText={!submission && <div style={{ fontSize: 14 }}>如不填写转载来源默认为直播间地址</div>}
         >
           <Radio value={2} style={{ alignItems: 'center', flexShrink: 0 }}>
             <span style={{ flexShrink: 0 }}>转载</span>
@@ -253,7 +259,13 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
             <Radio value={1}>自制</Radio>
           </div>
         </RadioGroup>
-        {plainTid ? (
+        {submission && treeData?.length ? (
+          <Form.Select field="tid" label="分区" filter style={{ width: 350 }}
+            optionList={treeData.flatMap(group => group.children.map(child => ({
+              value: child.value, label: `${group.label} / ${child.name}`,
+            })))}
+            rules={[{ required: true, message: '请选择投稿分区' }]} />
+        ) : plainTid || submission ? (
           <InputNumber
             field="tid"
             label="分区 ID"
@@ -287,7 +299,7 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
           label="标签"
           allowDuplicates={false}
           addOnBlur={true}
-          separator=","
+          separator={submission ? [',', '，'] : ','}
           placeholder="可用英文逗号分隔以批量输入标签，失焦/Enter 以保存"
           style={{ width: 560 }}
           rules={[{ required: true, message: 'Tag不能为空' }]}
@@ -308,12 +320,12 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
             })
           }}
         />
-        <Input
+        {coverField ?? <Input
           field="cover_path"
           label="视频封面"
           style={{ width: 464 }}
           placeholder="/cover/up.jpg"
-        />
+        />}
         <TextArea
           style={{ maxWidth: 560 }}
           field="description"
@@ -323,7 +335,7 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
           maxCount={2000}
           showClear
         />
-        <TextArea
+        {!submission && <TextArea
           style={{ maxWidth: 560 }}
           field="extra_fields"
           label="额外字段"
@@ -345,7 +357,7 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
               message: '请输入正确的Json格式文本',
             }
           ]}
-        />
+        />}
 
         <div style={{ display: 'flex', alignItems: 'center', color: 'var(--semi-color-tertiary)' }}>
           <Switch

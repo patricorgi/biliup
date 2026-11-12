@@ -47,6 +47,7 @@ export interface Gap {
 }
 
 export interface SessionDetail extends SessionSummary {
+  file_timeline?: boolean
   segments: SegmentView[]
   gaps: Gap[]
 }

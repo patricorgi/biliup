@@ -1,6 +1,6 @@
 'use client'
 import { Typography } from '@douyinfe/semi-ui'
-import { ReactNode } from 'react'
+import type { ReactNode, Ref } from 'react'
 import styles from './PageHeader.module.scss'
 
 const { Title, Text } = Typography
@@ -14,14 +14,16 @@ export default function PageHeader({
   description,
   icon,
   actions,
+  ref,
 }: {
   title: ReactNode
   description?: ReactNode
   icon?: ReactNode
   actions?: ReactNode
+  ref?: Ref<HTMLElement>
 }) {
   return (
-    <header className={styles.header}>
+    <header className={styles.header} ref={ref}>
       {icon ? <div className={styles.icon}>{icon}</div> : null}
       <div className={styles.titles}>
         <Title heading={4} style={{ margin: 0 }}>

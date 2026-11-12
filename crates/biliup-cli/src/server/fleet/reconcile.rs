@@ -1014,6 +1014,7 @@ impl Reconciler {
                             AddStreamerError::UnsupportedUrl => {
                                 "没有插件支持这个直播间地址".to_string()
                             }
+                            AddStreamerError::AlreadyExists => "主播已经存在".to_string(),
                             AddStreamerError::Internal(e) => format!("新增主播失败：{e:?}"),
                         })
                     }

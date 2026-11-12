@@ -1,9 +1,10 @@
 'use client'
-import { Spin, Table, Tooltip, Typography } from '@douyinfe/semi-ui'
+import { Button, Spin, Table, Toast, Tooltip, Typography } from '@douyinfe/semi-ui'
 import { SortOrder } from '@douyinfe/semi-ui/lib/es/table'
 import Link from 'next/link'
-import useSWR from 'swr'
-import { fetcher, type StreamerInfo } from '@/app/lib/api-streamer'
+import useSWR, { useSWRConfig } from 'swr'
+import { useState } from 'react'
+import { fetcher, type FileList, type StreamerInfo } from '@/app/lib/api-streamer'
 import { isReadable, replayHref, type SessionDetail, sessionUrl } from '@/app/lib/sessions'
 import { humDate } from '@/app/lib/utils'
 import { type AutoClipAvailability, useAutoClip, useSessionJob } from '@/app/lib/auto-clip'
@@ -12,6 +13,25 @@ import Filter from './Filter'
 import { useIsMobile } from '../../lib/useIsMobile'
 import dc from '@/app/ui/data-card.module.scss'
 import styles from './sessions.module.scss'
+import { useMe } from '@/app/lib/use-me'
+import TrashConfirmation from './TrashConfirmation'
+
+type RecordingFile = Pick<FileList, 'name' | 'updateTime' | 'size'>
+
+type SessionRecordings = {
+  recording: boolean
+  files: RecordingFile[]
+}
+
+type TrashSelection = {
+  session: StreamerInfo
+  all: boolean
+  files: RecordingFile[]
+}
+
+const recordingsUrl = (id: number) => `${sessionUrl(id)}/recordings`
+const errorMessage = (error: unknown) => error instanceof Error ? error.message : '录像操作失败'
+
 
 /** 「直播场次」：每场一行，能按场次回看的点「回看」进回看页 */
 export default function SessionsTab() {
@@ -19,6 +39,61 @@ export default function SessionsTab() {
   const { Text } = Typography
   const { data: data, error, isLoading } = useSWR<any[]>('/v1/streamer-info', fetcher)
   const autoClip = useAutoClip()
+  const { can } = useMe()
+  const canDelete = can('file.delete')
+  const { mutate } = useSWRConfig()
+  const [selection, setSelection] = useState<TrashSelection>()
+  const [preparing, setPreparing] = useState<number>()
+  const [pending, setPending] = useState(false)
+
+  const prepareSession = async (session: StreamerInfo) => {
+    setPreparing(session.id)
+    try {
+      const recordings: SessionRecordings = await fetcher(recordingsUrl(session.id))
+      if (recordings.recording) {
+        Toast.warning('直播仍在录制，请等录制结束')
+      } else {
+        setSelection({ session, all: true, files: recordings.files })
+      }
+    } catch (error) {
+      Toast.error(errorMessage(error))
+    } finally {
+      setPreparing(undefined)
+    }
+  }
+
+  const confirmTrash = async () => {
+    if (!selection || pending) return
+    setPending(true)
+    const { session, all, files } = selection
+    try {
+      const result: { moved: number; error: string | null; session_removed: boolean } = await fetcher(recordingsUrl(session.id), {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ all, files }),
+      })
+      if (result.error) {
+        Toast.error(result.moved > 0
+          ? `已移入废纸篓 ${result.moved} 个文件。${result.error}`
+          : result.error)
+      } else if (result.session_removed) {
+        await mutate('/v1/streamer-info', (rows: StreamerInfo[] | undefined) =>
+          rows?.filter(row => row.id !== session.id))
+        Toast.success('已删除场次')
+      } else {
+        Toast.success(`已将 ${result.moved} 个录制文件移入废纸篓`)
+      }
+    } catch (error) {
+      Toast.error(errorMessage(error))
+    } finally {
+      setSelection(undefined)
+      setPending(false)
+      void mutate(recordingsUrl(session.id))
+      void mutate(sessionUrl(session.id))
+      void mutate('/v1/videos')
+      void mutate('/v1/videos?include_archived=true')
+    }
+  }
 
   if (isLoading) {
     return (
@@ -80,19 +155,32 @@ export default function SessionsTab() {
       title: '',
       dataIndex: 'replay',
       fixed: 'right' as const,
-      width: 72,
-      render: (_: unknown, record: StreamerInfo) =>
-        record.has_timeline ? (
-          <Link href={replayHref(record.id)} className={styles.replayLink}>
-            回看
-          </Link>
-        ) : (
-          <Tooltip content="这一场在升级前录制，没有时间轴，不能按场次回看；请在「录制文件」里按文件播放">
-            <Text type="tertiary" className={styles.replayOff}>
+      width: canDelete ? 132 : 72,
+      render: (_: unknown, record: StreamerInfo) => (
+        <span className={styles.actions}>
+          {(record.has_timeline || record.has_legacy_recordings) ? (
+            <Link href={replayHref(record.id)} className={styles.replayLink}>
               回看
-            </Text>
-          </Tooltip>
-        ),
+            </Link>
+          ) : (
+            <Tooltip content="这场直播没有可用的回看时间轴">
+              <Text type="tertiary" className={styles.replayOff}>回看</Text>
+            </Tooltip>
+          )}
+          {canDelete && (
+            <Button
+              size="small"
+              type="danger"
+              theme="borderless"
+              disabled={preparing !== undefined && preparing !== record.id}
+              loading={preparing === record.id}
+              onClick={() => prepareSession(record)}
+            >
+              删除
+            </Button>
+          )}
+        </span>
+      ),
     },
   ]
 
@@ -104,9 +192,34 @@ export default function SessionsTab() {
         scroll={{ x: 'max-content' }}
         columns={columns}
         dataSource={data}
-        expandedRowRender={expandRowRender}
+        expandedRowRender={(record) => record && (
+          <FileLists
+            record={record}
+            onTrash={canDelete ? (file) => setSelection({ session: record, all: false, files: [file] }) : undefined}
+          />
+        )}
         empty={error ? '加载失败，请检查后端连接' : '暂无数据'}
       />
+      <TrashConfirmation
+        visible={selection !== undefined}
+        title={selection?.all ? '删除直播场次？' : '将录播移入废纸篓？'}
+        confirmText={selection?.all ? '删除场次' : '移入废纸篓'}
+        pending={pending}
+        onConfirm={confirmTrash}
+        onCancel={() => setSelection(undefined)}
+      >
+        {selection?.all && <p>{selection.session.name} · {humDate(selection.session.date)} · 共 {selection.files.length} 个录制文件</p>}
+        {selection?.all && (
+          <p>{selection.files.length > 0
+            ? '录像将移入废纸篓，场次也会从历史中移除。'
+            : '这场直播已没有录制文件，确认后将从历史中移除。'}</p>
+        )}
+        {!!selection?.files.length && (
+          <ul className={styles.trashFiles}>
+            {selection.files.map(file => <li key={file.name}>{file.name}</li>)}
+          </ul>
+        )}
+      </TrashConfirmation>
     </div>
   )
 }
@@ -129,10 +242,15 @@ function AutoClipCell({ record, availability }: { record: StreamerInfo; availabi
 const baseName = (path: string) => path.split(/[\\/]/).pop() ?? path
 
 // 展开子行:该次直播的录制文件列表；有时间轴的场次，能回看的文件可以直接定位到这一段
-const FileLists = ({ record }: { record: StreamerInfo }) => {
-  const { data: files, isLoading } = useSWR(`/v1/streamer-info/files/${record.id}`, fetcher)
+function FileLists({
+  record, onTrash,
+}: {
+  record: StreamerInfo
+  onTrash?: (file: RecordingFile) => void
+}) {
+  const { data, error, isLoading } = useSWR<SessionRecordings>(recordingsUrl(record.id), fetcher)
   const { data: detail } = useSWR<SessionDetail>(
-    record.has_timeline ? sessionUrl(record.id) : null,
+    record.has_timeline || record.has_legacy_recordings ? sessionUrl(record.id) : null,
     fetcher,
     {
       revalidateOnFocus: false,
@@ -144,31 +262,38 @@ const FileLists = ({ record }: { record: StreamerInfo }) => {
   )
 
   if (isLoading) return <div>加载中...</div>
-  if (!files || files.length === 0) return <div>暂无文件</div>
+  if (error) return <div>录像列表加载失败</div>
+  if (!data?.files.length) return <div>暂无录制文件</div>
 
   return (
-    <div style={{ padding: '4px 8px', fontSize: 13, color: 'var(--semi-color-text-1)' }}>
-      文件列表:
-      {files.map((it: any) => {
-        const start = startOf.get(baseName(it.file))
+    <div className={styles.files}>
+      文件列表
+      {data.files.map(file => {
+        const name = baseName(file.name)
+        const start = startOf.get(name)
         return (
-          <div
-            key={it.id}
-            style={{ padding: '2px 0 2px 24px', fontVariantNumeric: 'tabular-nums' }}
-          >
-            {it.file}
-            {start !== undefined ? (
+          <div key={file.name} className={styles.file}>
+            <span>{name}</span>
+            {start !== undefined && (
               <Link href={replayHref(record.id, start)} className={styles.fileReplay}>
                 回看这一段
               </Link>
-            ) : null}
+            )}
+            {onTrash && (
+              <Button
+                size="small"
+                type="danger"
+                theme="borderless"
+                disabled={data.recording}
+                title={data.recording ? '请等录制结束' : undefined}
+                onClick={() => onTrash(file)}
+              >
+                删除
+              </Button>
+            )}
           </div>
         )
       })}
     </div>
   )
-}
-
-const expandRowRender = (record: any) => {
-  return <FileLists record={record} />
 }

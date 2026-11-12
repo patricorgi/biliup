@@ -2,6 +2,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import useSWR from 'swr'
+import TranscriptPanel from './TranscriptPanel'
 import { Button, Empty, Spin, Switch, Tag, Toast, Tooltip, Typography } from '@douyinfe/semi-ui'
 import {
   IconArrowLeft,
@@ -514,20 +515,22 @@ export default function ReplayView({
   const canSave = canEdit && selection.in !== null && selection.out !== null && !selProblem
 
   /** 存为新切片（草稿），或把选段改动写回载入的切片 */
-  const saveClip = async (asNew: boolean) => {
-    if (selection.in === null || selection.out === null) return
+  const saveClip = async (asNew: boolean, transcriptRange?: { in: number; out: number }) => {
+    const range = transcriptRange ?? selection
+    if (saving || range.in === null || range.out === null || range.out <= range.in) return
     if (!canEdit) {
       Toast.warning({ id: 'clip-disabled', content: editReason, duration: 3 })
       return
     }
-    if (selProblem) {
-      Toast.warning({ content: selProblem, duration: 3 })
+    const problem = selectionProblem(range.in, range.out)
+    if (problem) {
+      Toast.warning({ content: problem, duration: 3 })
       return
     }
     setSaving(true)
     try {
       if (!asNew && loadedClip) {
-        const updated = await updateClip(loadedClip, { in_ms: selection.in, out_ms: selection.out })
+        const updated = await updateClip(loadedClip, { in_ms: range.in, out_ms: range.out })
         Toast.success({
           content: loadedClip.file_name && !updated.file_name ? '切片范围已更新，之前导出的文件已作废，请重新导出' : '切片范围已更新',
           duration: 3,
@@ -535,10 +538,14 @@ export default function ReplayView({
         return
       }
       const created = await createClip(sessionId, {
-        in_ms: selection.in,
-        out_ms: selection.out,
-        marker_id: selectionMarker,
+        in_ms: range.in,
+        out_ms: range.out,
+        marker_id: transcriptRange ? null : selectionMarker,
       })
+      if (transcriptRange) {
+        setSelection({ in: created.in_ms, out: created.out_ms })
+        setSelectionMarker(null)
+      }
       setActiveClip(created.id)
       setActiveSuggestion(null)
       setTab('clips')
@@ -546,6 +553,7 @@ export default function ReplayView({
         content: `已存为切片（${formatSpan(created.out_ms - created.in_ms)}）`,
         duration: 2,
       })
+      return true
     } catch (e) {
       if (!(e instanceof ReportedError)) Toast.error({ content: `保存切片失败：${errorText(e)}`, duration: 4 })
     } finally {
@@ -719,7 +727,7 @@ export default function ReplayView({
   // ---------- 快捷键（都有对应的按钮，快捷键只是加速） ----------
   const keyActions = useRef<(e: KeyboardEvent) => void>(() => {})
   const onKey = (e: KeyboardEvent) => {
-    if (e.ctrlKey || e.metaKey || e.altKey || isTyping(e.target)) return
+    if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey || isTyping(e.target)) return
     const key = e.key.length === 1 ? e.key.toLowerCase() : e.key
     const actions: Record<string, () => void> = {
       ' ': togglePlay,
@@ -729,11 +737,16 @@ export default function ReplayView({
       ArrowLeft: () => stepKeyframe(-1),
       ArrowRight: () => stepKeyframe(1),
       m: mark,
-      ...(compact ? {} : { i: () => setPoint('in'), o: () => setPoint('out') }),
+      ...(compact ? {} : {
+        i: () => setPoint('in'),
+        o: () => setPoint('out'),
+        ...(!saving && canSave && (!loadedClip || clipChanged) ? { s: () => void saveClip(true) } : {}),
+        ...(exporting === null && exportReason('quick') === null ? { c: () => void exportSelection('quick') } : {}),
+      }),
     }
     const action = actions[key]
     if (!action || !mode) return
-    if (e.repeat && (key === 'm' || key === 'i' || key === 'o' || key === ' ' || key === 'k')) return
+    if (e.repeat && (key === 'm' || key === 'i' || key === 'o' || key === 'c' || key === 's' || key === ' ' || key === 'k')) return
     e.preventDefault()
     action()
   }
@@ -943,6 +956,9 @@ export default function ReplayView({
       <QueueBanner paused={publishQueue.data?.paused} canSubmit={canSubmit} page />
       <div className={styles.page} data-compact={compact || undefined}>
         <div className={styles.main}>
+          {detail.file_timeline && (
+            <p className={styles.fileTimeline}>录像时间轴从第一段文件开头累计，按文件顺序接续。时间戳不对应原直播时间，未录到的间隔不会计入。</p>
+          )}
           <div className={styles.stage} ref={liveRootRef} data-mode={mode?.kind ?? 'none'}>
             {stage}
             {live ? <span className={styles.liveBadge}>直播</span> : null}
@@ -1128,8 +1144,9 @@ export default function ReplayView({
                         loading={saving}
                         disabled={!canSave || (!!loadedClip && !clipChanged)}
                         onClick={() => saveClip(true)}
+                        aria-keyshortcuts="S"
                       >
-                        {clipChanged ? '另存为新切片' : '存为切片'}
+                        {clipChanged ? '另存为新切片' : '存为切片'} <Kbd>S</Kbd>
                       </Button>
                     </span>
                   </Tooltip>
@@ -1150,8 +1167,9 @@ export default function ReplayView({
                               loading={exporting === m}
                               disabled={reason !== null || exporting !== null}
                               onClick={() => exportSelection(m)}
+                              aria-keyshortcuts={m === 'quick' ? 'C' : undefined}
                             >
-                              {clipModeText(m)}
+                              {clipModeText(m)} {m === 'quick' && <Kbd>C</Kbd>}
                             </Button>
                           </span>
                         </Tooltip>
@@ -1230,6 +1248,9 @@ export default function ReplayView({
           />
         </aside>
       </div>
+      <TranscriptPanel key={sessionId} sessionId={sessionId} canEdit={canEdit} recording={detail.recording}
+        onSeek={seek} playhead={playhead} playing={playing} duration={duration} saving={saving}
+        onSave={(start, end) => saveClip(true, { in: start, out: end })} />
       <PublishDrawer
         target={publishTarget}
         onClose={() => setPublishTarget(null)}

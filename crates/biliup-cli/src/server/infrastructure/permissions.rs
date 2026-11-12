@@ -99,6 +99,10 @@ pub enum Permission {
     LogView,
     #[serde(rename = "file.view")]
     FileView,
+    #[serde(rename = "file.delete")]
+    FileDelete,
+    #[serde(rename = "file.import")]
+    FileImport,
     #[serde(rename = "user.manage")]
     UserManage,
     /// 切片工作台：打标记、保留场次、改切片草稿
@@ -123,6 +127,8 @@ impl Permission {
         Permission::ConfigEdit,
         Permission::LogView,
         Permission::FileView,
+        Permission::FileDelete,
+        Permission::FileImport,
         Permission::UserManage,
         Permission::ClipEdit,
         Permission::NodeManage,
@@ -156,6 +162,8 @@ pub fn required_permission(method: &Method, route: &str, raw_path: &str) -> Opti
         "/v1/ws/live-rates" | "/v1/live-rates" if get => StreamerView,
         "/v1/sessions" | "/v1/sessions/{id}" | "/v1/sessions/{id}/keyframes" if get => FileView,
         "/v1/sessions/{id}/media" if get => PreviewView,
+        "/v1/sessions/{id}/transcript" if get => FileView,
+        "/v1/sessions/{id}/transcript" if method == Method::POST => ClipEdit,
         "/v1/sessions/{id}/markers" if get => FileView,
         "/v1/sessions/{id}/markers" if method == Method::POST => ClipEdit,
         "/v1/sessions/{id}/markers/{mid}"
@@ -165,6 +173,31 @@ pub fn required_permission(method: &Method, route: &str, raw_path: &str) -> Opti
         }
         // 与 /v1/status 同级：三个角色都能看首页的系统状态
         "/v1/system-stats" if get => StreamerView,
+        "/v1/clip-library/import" if method == Method::POST => FileImport,
+        "/v1/clip-library"
+        | "/v1/clip-library/preview/{cid}"
+        | "/v1/clip-library/output/{id}"
+        | "/v1/clip-library/output/{id}/subtitles"
+        | "/v1/clip-library/output/{id}/hardsubs"
+        | "/v1/clip-library/imported/{cid}/download"
+            if get =>
+        {
+            FileView
+        }
+        "/v1/clip-library/trim/{cid}"
+        | "/v1/clip-library/restore/{cid}"
+        | "/v1/clip-library/join"
+        | "/v1/clip-library/output/{id}/subtitles"
+        | "/v1/clip-library/output/{id}/hardsubs"
+            if method == Method::POST =>
+        {
+            ClipEdit
+        }
+        "/v1/clip-library/output/{id}/hardsubs" if method == Method::DELETE => ClipEdit,
+        "/v1/clip-library" | "/v1/clip-library/output/{id}" if method == Method::DELETE => {
+            FileDelete
+        }
+        "/v1/clip-library/output/{id}/subtitles/edit" if get || method == Method::PUT => ClipEdit,
         "/v1/sessions/{id}/clips" | "/v1/clips/{cid}" | "/v1/clips/{cid}/download" if get => {
             FileView
         }
@@ -217,8 +250,11 @@ pub fn required_permission(method: &Method, route: &str, raw_path: &str) -> Opti
         "/v1/get_qrcode" if get => AccountManage,
         "/v1/login_by_qrcode" if method == Method::POST => AccountManage,
         "/bili/archive/pre" if get => UploadSubmit,
-        "/v1/uploads" if method == Method::POST => UploadSubmit,
-        "/v1/videos" if get => FileView,
+        "/v1/uploads" | "/v1/uploads/files" if method == Method::POST => UploadSubmit,
+        "/v1/uploads/joins" | "/v1/uploads/jobs/{id}" if get => UploadSubmit,
+        "/v1/uploads/cover-generation" if get || method == Method::POST => UploadSubmit,
+        "/v1/videos" | "/v1/sessions/{id}/recordings" if get => FileView,
+        "/v1/videos" | "/v1/sessions/{id}/recordings" if method == Method::DELETE => FileDelete,
         "/v1/status" if get => StreamerView,
         // 三个角色都有 StreamerView，等于登录即可
         "/v1/tools" if get => StreamerView,

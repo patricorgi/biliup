@@ -1,16 +1,18 @@
 'use client'
-import { Modal, Table, Typography } from '@douyinfe/semi-ui'
+import { Button, Modal, Table, Toast, Typography } from '@douyinfe/semi-ui'
 import { SortOrder } from '@douyinfe/semi-ui/lib/es/table'
-import useSWR from 'swr'
-import { fetcher, FileList } from '@/app/lib/api-streamer'
+import useSWR, { useSWRConfig } from 'swr'
+import { API_BASE, fetcher, proxy, type FileList } from '@/app/lib/api-streamer'
 import { useState } from 'react'
 import dynamic from 'next/dynamic'
 import Link from 'next/link'
 import { humDate } from '@/app/lib/utils'
 import { formatSize } from '@/app/lib/use-dashboard'
-import { replayHref } from '@/app/lib/sessions'
+import { replayHref, sessionUrl } from '@/app/lib/sessions'
+import { useMe } from '@/app/lib/use-me'
 import dc from '@/app/ui/data-card.module.scss'
 import styles from './page.module.scss'
+import TrashConfirmation from './TrashConfirmation'
 
 const Players = dynamic(() => import('@/app/ui/Player'), {
   ssr: false,
@@ -19,9 +21,42 @@ const Players = dynamic(() => import('@/app/ui/Player'), {
 /** 「录制文件」：已录完的文件在线回放；属于某一场的文件能按场次打开回看 */
 export default function FilesTab() {
   const { Text } = Typography
-  const { data: data, error, isLoading } = useSWR<FileList[]>('/v1/videos', fetcher)
+  const { data, error, isLoading, mutate: refreshFiles } = useSWR<FileList[]>(
+    '/v1/videos?include_archived=true',
+    fetcher,
+  )
+  const { mutate } = useSWRConfig()
+  const { can } = useMe()
+  const canDelete = can('file.delete')
   const [fileName, setFileName] = useState<string>()
   const [visible, setVisible] = useState(false)
+  const [deleteTarget, setDeleteTarget] = useState<FileList>()
+  const [deleting, setDeleting] = useState(false)
+
+  const confirmDelete = async () => {
+    if (!deleteTarget || deleting) return
+    setDeleting(true)
+    try {
+      const { name, updateTime, size, session_id } = deleteTarget
+      await proxy('/v1/videos', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, updateTime, size }),
+      })
+      setDeleteTarget(undefined)
+      Toast.success('已移入废纸篓')
+      void mutate('/v1/videos')
+      if (session_id !== undefined) {
+        void mutate(sessionUrl(session_id))
+        void mutate(`${sessionUrl(session_id)}/recordings`)
+      }
+    } catch (error) {
+      Toast.error(error instanceof Error ? error.message : '无法将录制文件移入废纸篓')
+    } finally {
+      setDeleting(false)
+      void refreshFiles()
+    }
+  }
 
   const columns = [
     {
@@ -58,6 +93,16 @@ export default function FilesTab() {
               按场次回看
             </Link>
           ) : null}
+          {canDelete && (
+            <Button
+              size="small"
+              type="danger"
+              theme="borderless"
+              onClick={() => setDeleteTarget(record)}
+            >
+              删除
+            </Button>
+          )}
         </span>
       ),
     },
@@ -73,6 +118,7 @@ export default function FilesTab() {
       <div className={dc.card}>
         <Table
           size="small"
+          rowKey="name"
           scroll={{ x: 'max-content' }}
           columns={columns}
           dataSource={data}
@@ -80,6 +126,16 @@ export default function FilesTab() {
           empty={error ? '加载失败，请检查后端连接' : '暂无数据'}
         />
       </div>
+      <TrashConfirmation
+        visible={deleteTarget !== undefined}
+        title="将录播移入废纸篓？"
+        pending={deleting}
+        onConfirm={confirmDelete}
+        onCancel={() => setDeleteTarget(undefined)}
+      >
+        <p style={{ overflowWrap: 'anywhere' }}>{deleteTarget?.name}</p>
+        <p>此文件将移入运行 biliup 的电脑的废纸篓。</p>
+      </TrashConfirmation>
       <Modal
         visible={visible}
         onCancel={() => setVisible(false)}
@@ -89,7 +145,7 @@ export default function FilesTab() {
         bodyStyle={{ height: 500 }}
         footer={null}
       >
-        <Players url={(process.env.NEXT_PUBLIC_API_SERVER ?? '') + '/static/' + fileName} />
+        {fileName && <Players url={API_BASE + '/static/' + encodeURIComponent(fileName)} />}
         <div id="mse" />
       </Modal>
     </>

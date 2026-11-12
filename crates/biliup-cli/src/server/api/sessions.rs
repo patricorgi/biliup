@@ -48,6 +48,7 @@ pub struct SessionSummary {
     pub title: String,
     /// Unix 毫秒。
     pub started_at: i64,
+    pub file_timeline: bool,
     /// Unix 毫秒；进行中为 `null`。
     pub ended_at: Option<i64>,
     pub retain_until: Option<i64>,
@@ -70,6 +71,7 @@ impl From<SessionListRow> for SessionSummary {
             streamer_name: row.streamer_name,
             title: row.title,
             started_at: row.started_at,
+            file_timeline: row.file_timeline,
             ended_at: row.ended_at,
             retain_until: row.retain_until,
             duration_ms: row.end_ms,
@@ -202,6 +204,9 @@ async fn segment_view(row: SegmentRow) -> SegmentView {
 
 /// `GET /v1/sessions/{id}`
 pub async fn get_session(State(pool): State<ConnectionPool>, Path(id): Path<i64>) -> Response {
+    if let Err(error) = crate::server::workbench::legacy::prepare(&pool, id).await {
+        return internal(error);
+    }
     let summary = match store::session_summary(&pool, id).await {
         Ok(Some(row)) => SessionSummary::from(row),
         Ok(None) => return not_found(),

@@ -188,9 +188,8 @@ pub async fn serve_on(
 
     if let Some(path) = config_path.as_deref() {
         import_config_streamers(path, &service_register).await?;
-    } else {
-        import_database_streamers(&service_register).await?;
     }
+    import_database_streamers(&service_register, config_path.is_some()).await?;
 
     let fleet = server::fleet::start(&fleet, &service_register).await?;
 
@@ -255,9 +254,12 @@ async fn import_config_streamers(path: &Path, service_register: &ServiceRegister
             )?,
         )
         .await?;
+        let worker =
+            server::services::streamers::configured_worker(service_register, live_streamer.clone())
+                .await?;
         service_register
             .managers
-            .add_room(service_register.worker(live_streamer.clone(), upload_config))
+            .add_room(worker)
             .await
             .ok_or_else(|| {
                 Report::new(AppError::Custom(format!(
@@ -272,16 +274,50 @@ async fn import_config_streamers(path: &Path, service_register: &ServiceRegister
     Ok(())
 }
 
-async fn import_database_streamers(service_register: &ServiceRegister) -> AppResult<()> {
+async fn import_database_streamers(
+    service_register: &ServiceRegister,
+    has_config_file: bool,
+) -> AppResult<()> {
     let streamers = repositories::get_all_streamer(&service_register.pool).await?;
+    // A config file supplies its own room list. Include rooms explicitly managed
+    // through the recording API as well, without registering file rooms twice.
+    let configured = if has_config_file {
+        let already_loaded: std::collections::HashSet<_> = service_register
+            .managers
+            .get_rooms()
+            .await
+            .iter()
+            .map(|worker| worker.id())
+            .collect();
+        let managed: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM livestreamers WHERE recording_paused IS NOT NULL")
+                .fetch_all(&service_register.pool)
+                .await
+                .change_context(AppError::Unknown)?;
+        Some(
+            managed
+                .into_iter()
+                .filter(|id| !already_loaded.contains(id))
+                .collect::<std::collections::HashSet<_>>(),
+        )
+    } else {
+        None
+    };
     let mut imported = 0usize;
     for live_streamer in streamers {
-        let upload_config =
-            repositories::get_upload_config(&service_register.pool, live_streamer.id).await?;
+        if configured
+            .as_ref()
+            .is_some_and(|ids| !ids.contains(&live_streamer.id))
+        {
+            continue;
+        }
+        let worker =
+            server::services::streamers::configured_worker(service_register, live_streamer.clone())
+                .await?;
 
         service_register
             .managers
-            .add_room(service_register.worker(live_streamer.clone(), upload_config))
+            .add_room(worker)
             .await
             .ok_or_else(|| {
                 Report::new(AppError::Custom(format!(

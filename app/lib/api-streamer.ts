@@ -263,4 +263,5 @@ export interface StreamerInfo {
 	live_cover_path: string;
 	/** 这一场有时间轴，能在回看页打开（升级前录的场次没有） */
 	has_timeline?: boolean;
+	has_legacy_recordings?: boolean;
 }

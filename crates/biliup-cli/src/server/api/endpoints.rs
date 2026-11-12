@@ -3,7 +3,9 @@ use crate::server::api::live_preview::direct_capability;
 use crate::server::api::redact;
 use crate::server::auto_clip::runner::streamer_opted_in;
 use crate::server::common::recording_policy::{self, Rejection};
-use crate::server::common::upload::{build_studio, submit_to_bilibili, upload};
+use crate::server::common::upload::{
+    build_studio, desc_with_credits, studio_from_template, submit_to_bilibili, upload,
+};
 use crate::server::common::util::Recorder;
 use crate::server::config::Config;
 use crate::server::core::download_manager::DownloadManager;
@@ -22,15 +24,17 @@ use crate::server::infrastructure::repositories::{
     delete_bilibili_cookie, get_all_streamer, register_bilibili_cookie,
 };
 use crate::server::infrastructure::service_register::ServiceRegister;
+use crate::server::router::{ALLOWED_MEDIA_EXTENSIONS, RECORDINGS_DIR};
 use crate::server::services::configuration::{ApplyConfigError, apply_config};
 use crate::server::services::streamers::{
-    AddStreamerError, add_streamer, delete_streamer, toggle_pause, update_streamer,
+    AddStreamerError, add_streamer_with_recording_state, delete_streamer, set_recording_pause,
+    update_streamer,
 };
 use crate::server::workbench;
 use crate::{LogHandle, UploadLine};
 use axum::Json;
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{Multipart, Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use biliup::credential::{Credential, save_login_info};
 use chrono::Utc;
@@ -39,11 +43,16 @@ use error_stack::{Report, ResultExt};
 use ormlite::Model;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, UNIX_EPOCH};
-use tokio::fs;
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::time::{Duration, Instant, UNIX_EPOCH};
+use tokio::{
+    fs,
+    io::{AsyncReadExt, AsyncWriteExt},
+};
 use tracing::{info, warn};
+use workbench::clips::{export::ClipExports, hardsubs, library};
 
 /// 主播当前被录制策略挡下的原因，供 `/v1/streamers` 覆盖状态字段。
 ///
@@ -64,7 +73,13 @@ pub async fn get_streamers_endpoint(
     State(pool): State<ConnectionPool>,
     State(managers): State<Arc<DownloadManager>>,
     State(config): State<Arc<RwLock<Config>>>,
-) -> Result<Json<Vec<LiveStreamerResponse>>, Response> {
+) -> Result<
+    (
+        [(&'static str, &'static str); 1],
+        Json<Vec<LiveStreamerResponse>>,
+    ),
+    Response,
+> {
     let live_streamers = get_all_streamer(&pool).await.map_err(report_to_response)?;
     let mut results = Vec::new();
     let workers = managers.get_rooms().await;
@@ -100,7 +115,7 @@ pub async fn get_streamers_endpoint(
         // 时间类条件按当前时钟实时算，不依赖监控循环轮到这个房间，因此不会过期；
         // 依赖房间标题的结论来自最近一次探测。正在录制时不覆盖。
         let status = match rejection_status(&x, option.as_deref()) {
-            Some(reason) if status != "Working" => reason.to_string(),
+            Some(reason) if status != "Working" && status != "Pause" => reason.to_string(),
             _ => status,
         };
         let (live_bytes_per_sec, live_media, preview) = match live {
@@ -132,7 +147,7 @@ pub async fn get_streamers_endpoint(
         });
     }
     fill_marker_counts(&pool, &mut results).await;
-    Ok(Json(results))
+    Ok(([("x-biliup-recording-pause", "1")], Json(results)))
 }
 
 /// 给录制中的房间填上本场的标记数；查询失败只记日志，这一轮不带标记数。
@@ -160,9 +175,15 @@ fn strip_hooks(streamer: &mut LiveStreamer) {
     streamer.postprocessor = None;
 }
 
+#[derive(Deserialize)]
+pub struct StreamerRecordingOptions {
+    paused: Option<bool>,
+}
+
 pub async fn post_streamers_endpoint(
     caller: Caller,
     State(service_register): State<ServiceRegister>,
+    Query(recording): Query<StreamerRecordingOptions>,
     Json(mut payload): Json<InsertLiveStreamer>,
 ) -> Result<Json<LiveStreamer>, Response> {
     if !caller.can_access(Field::StreamerHooks) {
@@ -172,10 +193,19 @@ pub async fn post_streamers_endpoint(
         payload.downloaded_processor = None;
         payload.postprocessor = None;
     }
-    match add_streamer(&service_register, payload).await {
+    match add_streamer_with_recording_state(
+        &service_register,
+        payload,
+        recording.paused.unwrap_or(false),
+    )
+    .await
+    {
         Ok(live_streamers) => Ok(Json(live_streamers)),
         Err(AddStreamerError::UnsupportedUrl) => {
             Err((StatusCode::BAD_REQUEST, "Not supported url").into_response())
+        }
+        Err(AddStreamerError::AlreadyExists) => {
+            Err((StatusCode::CONFLICT, "Already added").into_response())
         }
         Err(AddStreamerError::Internal(report)) => Err(report_to_response(report)),
     }
@@ -225,10 +255,13 @@ pub async fn delete_streamers_endpoint(
 
 // #[axum::debug_handler(state = ServiceRegister)]
 pub async fn pause_streamers_endpoint(
-    State(managers): State<Arc<DownloadManager>>,
+    State(services): State<ServiceRegister>,
     Path(id): Path<i64>,
+    Query(recording): Query<StreamerRecordingOptions>,
 ) -> Result<Json<()>, Response> {
-    toggle_pause(&managers, id).await;
+    set_recording_pause(&services, id, recording.paused)
+        .await
+        .map_err(report_to_response)?;
     Ok(Json(()))
 }
 
@@ -276,6 +309,7 @@ pub struct StreamerInfoView {
     pub info: StreamerInfo,
     /// 这一场有时间轴（升级后录的、写出过分段），能按场次回看。
     pub has_timeline: bool,
+    pub has_legacy_recordings: bool,
 }
 
 pub async fn get_streamer_info(
@@ -283,6 +317,7 @@ pub async fn get_streamer_info(
     State(pool): State<ConnectionPool>,
 ) -> Result<Json<Vec<StreamerInfoView>>, Response> {
     let streamer_infos = StreamerInfo::select()
+        .where_("deleted_at IS NULL")
         .fetch_all(&pool)
         .await
         .change_context(AppError::Unknown)
@@ -292,11 +327,16 @@ pub async fn get_streamer_info(
         .change_context(AppError::Unknown)
         .map_err(report_to_response)?;
 
+    let legacy = workbench::legacy::available(&pool)
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
     Ok(Json(
         streamer_infos
             .into_iter()
             .map(|info| StreamerInfoView {
                 has_timeline: with_timeline.contains(&info.id),
+                has_legacy_recordings: legacy.contains(&info.id),
                 info,
             })
             .collect(),
@@ -548,7 +588,7 @@ mod template_field_tests {
     use crate::server::infrastructure::models::upload_streamer::InsertUploadStreamer;
     use crate::server::infrastructure::permissions::Role;
     use crate::server::infrastructure::policy::Subject;
-    use axum::http::StatusCode;
+    use axum::http::{HeaderMap, StatusCode};
     use ormlite::Model;
 
     fn template(id: Option<i64>, cookie: &str, cover: &str) -> InsertUploadStreamer {
@@ -666,65 +706,91 @@ pub async fn login_by_qrcode(
     Ok(Json(json!({ "filename": filename })))
 }
 
-/// `GET /v1/videos`：工作目录下的录像文件。属于某一场、能按场次回看的文件另带 `session_id` 和
-/// `segment_start_ms`（这一段在场次时间轴上的起点），前端据此打开回看页并定位到这一段。
+#[derive(Deserialize)]
+pub struct VideoListQuery {
+    #[serde(default)]
+    include_archived: bool,
+}
+
+/// 剪辑台还列出已被后处理移动到 recordings/ 的录像。
 pub async fn get_videos(
     State(pool): State<ConnectionPool>,
+    Query(query): Query<VideoListQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, Response> {
-    let media_extensions = [".mp4", ".flv", ".3gp", ".webm", ".mkv", ".ts"];
-    let blacklist = ["next-env.d.ts"];
-    let segments = match workbench::store::replayable_segment_files(&pool).await {
+    let mut segments = match workbench::store::replayable_segment_files(&pool).await {
         Ok(files) => files,
         Err(error) => {
             warn!(%error, "读取分段失败，录像列表不带场次");
             Vec::new()
         }
     };
-    let cwd = std::env::current_dir().ok();
-    let segments = workbench::store::segment_files_in_dir(segments, cwd.as_deref());
+    let root =
+        std::env::current_dir().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+    for segment in &mut segments {
+        segment.path = root.join(&segment.path).to_string_lossy().into_owned();
+    }
+
+    let mut directories = vec![("", root.clone())];
+    let archive = root.join(RECORDINGS_DIR);
+    if query.include_archived
+        && fs::symlink_metadata(&archive)
+            .await
+            .is_ok_and(|m| m.is_dir())
+    {
+        directories.push((RECORDINGS_DIR, archive));
+    }
 
     let mut file_list = Vec::new();
-    let mut index = 1;
-
-    // **use tokio::fs::read_dir**
-    if let Ok(mut entries) = fs::read_dir(".").await {
+    for (prefix, directory) in directories {
+        let segments = workbench::store::segment_files_in_dir(segments.clone(), Some(&directory));
+        let Ok(mut entries) = fs::read_dir(&directory).await else {
+            continue;
+        };
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            let file_name = entry.file_name().to_string_lossy().into_owned();
-
-            if blacklist.contains(&file_name.as_str()) {
+            let entry_name = entry.file_name();
+            let Some(file_name) = entry_name.to_str() else {
                 continue;
-            }
-
-            if let Some(ext) = path.extension().and_then(|e| e.to_str())
-                && media_extensions
-                    .iter()
-                    .any(|allowed| ext == allowed.trim_start_matches('.'))
+            };
+            if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| {
+                    ALLOWED_MEDIA_EXTENSIONS
+                        .iter()
+                        .any(|allowed| ext.eq_ignore_ascii_case(allowed))
+                })
                 && let Ok(metadata) = entry.metadata().await
+                && metadata.is_file()
             {
-                let mtime = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-
-                let mut item = serde_json::json!({
-                    "key": index,
-                    "name": file_name,
-                    "updateTime": mtime,
+                let name = if prefix.is_empty() {
+                    file_name.to_owned()
+                } else {
+                    format!("{prefix}/{file_name}")
+                };
+                let mut item = json!({
+                    "key": file_list.len() + 1,
+                    "name": name,
+                    "updateTime": video_modified_seconds(&metadata),
                     "size": metadata.len(),
                 });
-                if let Some(segment) = segments.get(&file_name) {
+                if let Some(segment) = segments.get(file_name) {
                     item["session_id"] = segment.session_id.into();
                     item["segment_start_ms"] = segment.start_ms.into();
                 }
                 file_list.push(item);
-                index += 1;
             }
         }
     }
     Ok(Json(file_list))
+}
+
+pub(super) fn video_modified_seconds(metadata: &std::fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_secs())
 }
 
 /// 外部工具是否可用（目前只有 ffmpeg），前端据此决定依赖 ffmpeg 的功能能否使用。
@@ -789,29 +855,10 @@ pub async fn post_uploads(
     State(pool): State<ConnectionPool>,
     Json(json_data): Json<PostUploads>,
 ) -> Result<Json<serde_json::Value>, Response> {
-    let upload_config = UploadStreamer::select()
-        .where_("id = ?")
-        .bind(json_data.template_id)
-        .fetch_optional(&pool)
-        .await
-        .change_context(AppError::Unknown)
-        .map_err(report_to_response)?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "上传模板不存在").into_response())?;
+    let upload_config = upload_template(&pool, json_data.template_id).await?;
     if upload_config.is_noop_uploader() {
-        info!(
-            uploader = ?upload_config.uploader,
-            "Skipping page upload because uploader is Noop"
-        );
         return Ok(Json(json!({})));
     }
-
-    let (line, limit, submit_api) = {
-        let config = config.read().unwrap();
-        let line = UploadLine::from_str(&config.lines, true).ok();
-        let limit = config.threads;
-        let submit_api = config.submit_api.clone();
-        (line, limit, submit_api)
-    };
     let root = std::env::current_dir()
         .change_context(AppError::Unknown)
         .map_err(report_to_response)?;
@@ -831,8 +878,500 @@ pub async fn post_uploads(
     if files.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "至少选择一个媒体文件").into_response());
     }
+    queue_page_upload(&config, upload_config, files, None, None);
+    Ok(Json(json!({})))
+}
+
+#[derive(Serialize)]
+pub struct UploadJoin {
+    id: String,
+    filename: String,
+    created_at: i64,
+    clip_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hardsubs_filename: Option<String>,
+}
+
+pub async fn get_upload_joins(
+    State(exports): State<Arc<ClipExports>>,
+) -> Result<Json<Vec<UploadJoin>>, Response> {
+    let root = exports.library_dir();
+    let jobs = library::list(&root).await.map_err(upload_storage_error)?;
+    Ok(Json(
+        jobs.into_iter()
+            .filter(|job| {
+                job.kind == library::Kind::Join
+                    && job.status == library::Status::Ready
+                    && job.progress.is_none()
+            })
+            .enumerate()
+            .filter_map(|(index, job)| {
+                let filename = job.filename();
+                let hardsubs_filename =
+                    hardsubs::current_path(&root.join(&filename)).and_then(|path| {
+                        path.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                    });
+                (index < 30 || hardsubs_filename.is_some()).then_some(UploadJoin {
+                    filename,
+                    id: job.id,
+                    created_at: job.created_at,
+                    clip_count: job.clip_ids.len(),
+                    hardsubs_filename,
+                })
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Deserialize)]
+struct UploadSelection {
+    template_id: i64,
+    sources: Vec<UploadSource>,
+    details: UploadDetails,
+}
+
+#[derive(Deserialize)]
+struct UploadDetails {
+    title: String,
+    tags: Vec<String>,
+    description: String,
+    settings: Option<ManualUploadSettings>,
+}
+
+#[derive(Deserialize)]
+struct ManualUploadSettings {
+    copyright: u8,
+    copyright_source: String,
+    tid: u16,
+    tid_v2: Option<u32>,
+    dynamic: String,
+    dtime: Option<u32>,
+    dolby: bool,
+    hires: bool,
+    no_reprint: bool,
+    is_only_self: bool,
+    charging_pay: bool,
+    up_close_danmu: bool,
+    up_close_reply: bool,
+    up_selection_reply: bool,
+    credits: Vec<ManualCredit>,
+    use_template_cover: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ManualCredit {
+    username: String,
+    uid: u64,
+}
+
+impl ManualUploadSettings {
+    fn apply(&self, template: &mut UploadStreamer) -> Result<(), Response> {
+        if !matches!(self.copyright, 1 | 2) || self.tid == 0 || self.tid_v2 == Some(0) {
+            return Err(upload_input_error("请选择有效的投稿类型和分区"));
+        }
+        if self
+            .credits
+            .iter()
+            .any(|credit| credit.uid == 0 || credit.username.trim().is_empty())
+        {
+            return Err(upload_input_error(
+                "请为简介中要 @ 的用户填写用户名和有效 UID",
+            ));
+        }
+        template.copyright = Some(self.copyright);
+        template.copyright_source = Some(if self.copyright == 2 {
+            self.copyright_source.trim().to_owned()
+        } else {
+            String::new()
+        });
+        template.tid = Some(self.tid);
+        template.tid_v2 = self.tid_v2;
+        template.dynamic = Some(self.dynamic.clone());
+        template.dtime = self.dtime;
+        template.dolby = Some(self.dolby.into());
+        template.hires = Some(self.hires.into());
+        template.no_reprint = Some(self.no_reprint.into());
+        template.is_only_self = Some(self.is_only_self.into());
+        template.charging_pay = Some(self.charging_pay.into());
+        template.up_close_danmu = Some(self.up_close_danmu);
+        template.up_close_reply = Some(self.up_close_reply);
+        template.up_selection_reply = Some(self.up_selection_reply);
+        template.credits = Some(json!(self.credits));
+        if !self.use_template_cover {
+            template.cover_path = None;
+        }
+        Ok(())
+    }
+}
+
+struct ManualUpload {
+    id: String,
+    details: UploadDetails,
+    cover: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PageUploadStatus {
+    Uploading,
+    Submitting,
+    Submitted,
+    Failed { message: String },
+}
+
+struct PageUploadJob {
+    owner: Option<i64>,
+    status: PageUploadStatus,
+    updated: Instant,
+}
+
+static PAGE_UPLOADS: LazyLock<Mutex<HashMap<String, PageUploadJob>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub async fn get_page_upload(
+    caller: Caller,
+    Path(id): Path<String>,
+) -> Result<Json<PageUploadStatus>, StatusCode> {
+    let jobs = PAGE_UPLOADS.lock().unwrap();
+    jobs.get(&id)
+        .filter(|job| job.owner == caller.subject.user_id)
+        .map(|job| Json(job.status.clone()))
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+fn start_page_upload(owner: Option<i64>) -> String {
+    let mut jobs = PAGE_UPLOADS.lock().unwrap();
+    jobs.retain(|_, job| {
+        matches!(
+            job.status,
+            PageUploadStatus::Uploading | PageUploadStatus::Submitting
+        ) || job.updated.elapsed() < Duration::from_secs(24 * 60 * 60)
+    });
+    let id = format!("{:032x}", rand::random::<u128>());
+    jobs.insert(
+        id.clone(),
+        PageUploadJob {
+            owner,
+            status: PageUploadStatus::Uploading,
+            updated: Instant::now(),
+        },
+    );
+    id
+}
+
+fn set_page_upload(id: &str, status: PageUploadStatus) {
+    if let Some(job) = PAGE_UPLOADS.lock().unwrap().get_mut(id) {
+        job.status = status;
+        job.updated = Instant::now();
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum UploadSource {
+    Recording { name: String },
+    Join { id: String },
+    Hardsubs { id: String },
+    Local,
+}
+
+pub async fn post_upload_files(
+    caller: Caller,
+    State(config): State<Arc<RwLock<Config>>>,
+    State(pool): State<ConnectionPool>,
+    State(exports): State<Arc<ClipExports>>,
+    headers: HeaderMap,
+    mut body: Multipart,
+) -> Result<Json<serde_json::Value>, Response> {
+    // Require a preflight for cross-origin browser submissions, unlike a plain multipart form.
+    if headers
+        .get("x-biliup-upload")
+        .and_then(|value| value.to_str().ok())
+        != Some("1")
+    {
+        return Err((StatusCode::FORBIDDEN, "缺少投稿请求标记").into_response());
+    }
+    let mut field = body
+        .next_field()
+        .await
+        .map_err(IntoResponse::into_response)?
+        .filter(|field| field.name() == Some("selection"))
+        .ok_or_else(|| upload_input_error("缺少投稿文件清单"))?;
+    let mut manifest = Vec::new();
+    while let Some(chunk) = field.chunk().await.map_err(IntoResponse::into_response)? {
+        if manifest.len() + chunk.len() > 64 * 1024 {
+            return Err(upload_input_error("投稿文件清单过大"));
+        }
+        manifest.extend_from_slice(&chunk);
+    }
+    drop(field);
+    let selection: UploadSelection =
+        serde_json::from_slice(&manifest).map_err(|_| upload_input_error("投稿文件清单无效"))?;
+    if selection.sources.is_empty() || selection.sources.len() > 100 {
+        return Err(upload_input_error("请选择 1 至 100 个媒体文件"));
+    }
+    let mut details = selection.details;
+    details.title = details.title.trim().to_owned();
+    if details.title.is_empty() {
+        return Err(upload_input_error("请填写稿件标题"));
+    }
+    details.tags = details
+        .tags
+        .into_iter()
+        .map(|tag| tag.trim().to_owned())
+        .filter(|tag| !tag.is_empty())
+        .collect();
+    if details.tags.iter().any(|tag| tag.contains([',', '，'])) {
+        return Err(upload_input_error("请分开填写每个标签"));
+    }
+    crate::server::workbench::clips::publish::StudioOverride {
+        title: Some(details.title.clone()),
+        desc: Some(details.description.clone()),
+        tags: Some(details.tags.clone()),
+        ..Default::default()
+    }
+    .validate()
+    .map_err(upload_input_error)?;
+    let mut upload_config = upload_template(&pool, selection.template_id).await?;
+    if let Some(settings) = &details.settings {
+        settings.apply(&mut upload_config)?;
+    }
+    if upload_config.is_noop_uploader() {
+        return Err(upload_input_error("此模板未启用 B 站上传"));
+    }
+    let root = std::env::current_dir().map_err(upload_storage_error)?;
+    let mut staging = None;
+    let mut files = Vec::with_capacity(selection.sources.len());
+    let mut received = 0u64;
+    for (index, source) in selection.sources.into_iter().enumerate() {
+        let path = match source {
+            UploadSource::Recording { name } => {
+                crate::server::router::resolve_recording_path(&root, &name)
+                    .map_err(|_| upload_input_error(format!("找不到可投稿的录像：{name}")))?
+            }
+            UploadSource::Join { id } => super::clip_library::joined_output(&exports, &id)
+                .await
+                .map_err(IntoResponse::into_response)?,
+            UploadSource::Hardsubs { id } => super::clip_library::joined_hardsubs(&exports, &id)
+                .await
+                .map_err(IntoResponse::into_response)?,
+            UploadSource::Local => {
+                if staging.is_none() {
+                    staging = Some(
+                        tempfile::Builder::new()
+                            .prefix("biliup-upload-")
+                            .tempdir()
+                            .map_err(upload_storage_error)?,
+                    );
+                }
+                let field = body
+                    .next_field()
+                    .await
+                    .map_err(IntoResponse::into_response)?
+                    .filter(|field| field.name() == Some("local"))
+                    .ok_or_else(|| upload_input_error("缺少所选电脑文件"))?;
+                let directory = staging
+                    .as_ref()
+                    .expect("local upload directory")
+                    .path()
+                    .join(index.to_string());
+                stage_upload_file(field, directory, &mut received).await?
+            }
+        };
+        files.push(path);
+    }
+    let mut cover = match body
+        .next_field()
+        .await
+        .map_err(IntoResponse::into_response)?
+    {
+        Some(mut field) if field.name() == Some("cover") => {
+            let mut bytes = Vec::new();
+            while let Some(chunk) = field.chunk().await.map_err(IntoResponse::into_response)? {
+                if bytes.len() + chunk.len() > 5 * 1024 * 1024 {
+                    return Err(upload_input_error("封面不能超过 5 MB"));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            drop(field);
+            let jpeg = tokio::task::spawn_blocking(move || cover_jpeg(bytes))
+                .await
+                .map_err(|_| upload_input_error("无法处理封面图片"))?
+                .map_err(upload_input_error)?;
+            Some(jpeg)
+        }
+        Some(_) => return Err(upload_input_error("投稿请求包含多余的文件")),
+        None => None,
+    };
+    if body
+        .next_field()
+        .await
+        .map_err(IntoResponse::into_response)?
+        .is_some()
+    {
+        return Err(upload_input_error("投稿请求包含多余的文件"));
+    }
+    if cover.is_none()
+        && let Some(path) = upload_config.cover_path.as_deref()
+        && !path.trim().is_empty()
+        && !["http://", "https://", "//"]
+            .iter()
+            .any(|prefix| path.starts_with(prefix))
+    {
+        let file = fs::File::open(path)
+            .await
+            .map_err(|_| upload_input_error("无法读取模板封面，请重新选择封面或移除模板封面"))?;
+        let mut bytes = Vec::new();
+        file.take(5 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| upload_input_error("无法读取模板封面，请重新选择封面"))?;
+        if bytes.len() > 5 * 1024 * 1024 {
+            return Err(upload_input_error("模板封面不能超过 5 MB，请重新选择封面"));
+        }
+        cover = Some(
+            tokio::task::spawn_blocking(move || cover_jpeg(bytes))
+                .await
+                .map_err(|_| upload_input_error("无法处理模板封面"))?
+                .map_err(upload_input_error)?,
+        );
+    }
+    let id = start_page_upload(caller.subject.user_id);
+    queue_page_upload(
+        &config,
+        upload_config,
+        files,
+        staging,
+        Some(ManualUpload {
+            id: id.clone(),
+            details,
+            cover,
+        }),
+    );
+    Ok(Json(json!({"id": id})))
+}
+
+pub(super) fn cover_jpeg(bytes: Vec<u8>) -> Result<Vec<u8>, &'static str> {
+    use image::{ImageFormat, ImageReader, Limits, codecs::jpeg::JpegEncoder};
+    let mut reader = ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| "无法读取封面图片")?;
+    if !matches!(reader.format(), Some(ImageFormat::Jpeg | ImageFormat::Png)) {
+        return Err("封面必须是 JPG 或 PNG 图片");
+    }
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader
+        .decode()
+        .map_err(|_| "无法解码封面图片，或图片尺寸过大")?
+        .into_rgb8();
+    let mut jpeg = Vec::new();
+    JpegEncoder::new_with_quality(&mut jpeg, 90)
+        .encode_image(&image)
+        .map_err(|_| "无法转换封面图片")?;
+    if jpeg.len() > 5 * 1024 * 1024 {
+        return Err("转换后的封面超过 5 MB，请换一张较小的图片");
+    }
+    Ok(jpeg)
+}
+
+async fn stage_upload_file(
+    mut field: axum::extract::multipart::Field<'_>,
+    directory: PathBuf,
+    received: &mut u64,
+) -> Result<PathBuf, Response> {
+    let filename = field
+        .file_name()
+        .filter(|name| !name.contains(['/', '\\', ':']) && !name.chars().any(char::is_control))
+        .filter(|name| {
+            std::path::Path::new(name)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| {
+                    [
+                        "mp4", "flv", "avi", "wmv", "mov", "webm", "mpeg4", "ts", "mpg", "rm",
+                        "rmvb", "mkv", "m4v", "3gp",
+                    ]
+                    .iter()
+                    .any(|allowed| ext.eq_ignore_ascii_case(allowed))
+                })
+        })
+        .ok_or_else(|| upload_input_error("请选择支持的视频文件"))?;
+    let path = directory.join(filename);
+    fs::create_dir(&directory)
+        .await
+        .map_err(upload_storage_error)?;
+    let mut output = fs::File::create_new(&path)
+        .await
+        .map_err(upload_storage_error)?;
+    let start = *received;
+    while let Some(chunk) = field.chunk().await.map_err(IntoResponse::into_response)? {
+        *received += chunk.len() as u64;
+        if *received > 16 * 1024 * 1024 * 1024 {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "一次最多接收 16 GiB 电脑视频",
+            )
+                .into_response());
+        }
+        output
+            .write_all(&chunk)
+            .await
+            .map_err(upload_storage_error)?;
+    }
+    output.flush().await.map_err(upload_storage_error)?;
+    if *received == start {
+        return Err(upload_input_error("所选电脑文件为空"));
+    }
+    Ok(path)
+}
+
+fn upload_input_error(message: impl Into<String>) -> Response {
+    (StatusCode::BAD_REQUEST, message.into()).into_response()
+}
+
+fn upload_storage_error(error: std::io::Error) -> Response {
+    warn!(%error, "投稿文件读取或保存失败");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "无法读取或保存投稿文件，请检查磁盘空间和权限",
+    )
+        .into_response()
+}
+
+async fn upload_template(pool: &ConnectionPool, id: i64) -> Result<UploadStreamer, Response> {
+    UploadStreamer::select()
+        .where_("id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "上传模板不存在").into_response())
+}
+
+fn queue_page_upload(
+    config: &RwLock<Config>,
+    upload_config: UploadStreamer,
+    files: Vec<PathBuf>,
+    staging: Option<tempfile::TempDir>,
+    manual: Option<ManualUpload>,
+) {
+    let (line, limit, submit_api) = {
+        let config = config.read().unwrap();
+        let line = UploadLine::from_str(&config.lines, true).ok();
+        let limit = config.threads;
+        let submit_api = config.submit_api.clone();
+        (line, limit, submit_api)
+    };
     info!("通过页面开始上传");
     tokio::spawn(async move {
+        let _staging = staging;
+        let mut submitting = false;
         let result = async {
             let (bilibili, videos) = upload(
                 upload_config
@@ -856,13 +1395,73 @@ pub async fn post_uploads(
                         "",
                     ),
                 );
-                let studio = build_studio(&upload_config, &bilibili, videos, &recorder).await?;
-                submit_to_bilibili(&bilibili, &studio, submit_api.as_deref()).await?;
+                submitting = true;
+                if let Some(manual) = &manual {
+                    set_page_upload(&manual.id, PageUploadStatus::Submitting);
+                    let mut studio = studio_from_template(&upload_config, videos, &recorder);
+                    if let Some(cover) = &manual.cover {
+                        studio.cover =
+                            bilibili
+                                .cover_up(cover)
+                                .await
+                                .change_context(AppError::Custom(
+                                    "封面上传失败，稿件未提交。".into(),
+                                ))?;
+                    }
+                    studio.title.clone_from(&manual.details.title);
+                    studio.tag = manual.details.tags.join(",");
+                    (studio.desc, studio.desc_v2) = desc_with_credits(
+                        manual.details.description.clone(),
+                        upload_config.credits.as_ref(),
+                    );
+                    if let Some(extra) = &mut studio.extra_fields {
+                        extra.retain(|key, _| {
+                            !matches!(
+                                key.as_str(),
+                                "title"
+                                    | "tag"
+                                    | "desc"
+                                    | "desc_v2"
+                                    | "cover"
+                                    | "copyright"
+                                    | "source"
+                                    | "tid"
+                                    | "tid_v2"
+                                    | "dynamic"
+                                    | "dtime"
+                                    | "dolby"
+                                    | "lossless_music"
+                                    | "no_reprint"
+                                    | "is_only_self"
+                                    | "charging_pay"
+                                    | "up_close_danmu"
+                                    | "up_close_reply"
+                                    | "up_selection_reply"
+                                    | "videos"
+                                    | "aid"
+                            )
+                        });
+                    }
+                    studio.lossless_music = upload_config.hires.unwrap_or_default();
+                    submit_to_bilibili(&bilibili, &studio, Some("web")).await?;
+                } else {
+                    let studio = build_studio(&upload_config, &bilibili, videos, &recorder).await?;
+                    submit_to_bilibili(&bilibili, &studio, submit_api.as_deref()).await?;
+                }
                 info!(template_id = upload_config.id, "通过页面上传成功");
             }
             Ok::<_, Report<AppError>>(())
         }
         .await;
+        if let Some(manual) = &manual {
+            let status = match &result {
+                Ok(()) => PageUploadStatus::Submitted,
+                Err(error) => PageUploadStatus::Failed {
+                    message: page_upload_error(error, submitting),
+                },
+            };
+            set_page_upload(&manual.id, status);
+        }
         if result.is_err() {
             // Upload failures can wrap upstream response bodies containing
             // short-lived upload authorization. Keep persistent Web logs free
@@ -870,8 +1469,35 @@ pub async fn post_uploads(
             tracing::error!(template_id = upload_config.id, "页面上传失败");
         }
     });
+}
 
-    Ok(Json(serde_json::json!({})))
+fn page_upload_error(error: &Report<AppError>, submitting: bool) -> String {
+    if let AppError::Custom(message) = error.current_context()
+        && message == "封面上传失败，稿件未提交。"
+    {
+        return message.clone();
+    }
+    if !submitting {
+        return "视频上传失败，请检查模板的 B 站账号和网络连接。".into();
+    }
+    let code =
+        error
+            .frames()
+            .find_map(|frame| match frame.downcast_ref::<biliup::error::Kind>()? {
+                biliup::error::Kind::RateLimit { code, .. } => Some(*code),
+                biliup::error::Kind::Custom(message) => message
+                    .strip_prefix("ResponseData { code: ")?
+                    .split(',')
+                    .next()?
+                    .parse()
+                    .ok(),
+                _ => None,
+            });
+    match code {
+        Some(21566) => "视频已上传，但 B 站拒绝投稿（21566）：投稿过于频繁，建议将 APP 升级至最新版本后再试。".into(),
+        Some(code) => format!("视频已上传，但 B 站拒绝投稿（{code}）。"),
+        None => "视频已上传，但没有收到 B 站的投稿确认。请先在 B 站稿件管理确认是否已提交，再决定是否重试。".into(),
+    }
 }
 
 #[cfg(test)]
@@ -944,7 +1570,7 @@ mod recording_policy_status_tests {
             .unwrap();
 
         let managers = Arc::new(DownloadManager::new(1, 0, pool.clone()));
-        let Json(responses) = get_streamers_endpoint(
+        let (_, Json(responses)) = get_streamers_endpoint(
             Caller::unrestricted(),
             State(pool),
             State(managers),
@@ -983,7 +1609,7 @@ mod recording_policy_status_tests {
             .unwrap();
 
         let managers = Arc::new(DownloadManager::new(1, 0, pool.clone()));
-        let Json(responses) = get_streamers_endpoint(
+        let (_, Json(responses)) = get_streamers_endpoint(
             Caller::unrestricted(),
             State(pool),
             State(managers),

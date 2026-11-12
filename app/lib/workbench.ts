@@ -1,7 +1,7 @@
 /** 「剪辑台」页 `/workbench` 的 Tab，记在查询串 `?tab=` 里，刷新和分享都停在同一个 Tab */
-export type WorkbenchTab = 'sessions' | 'files' | 'monitor'
+export type WorkbenchTab = 'sessions' | 'files' | 'clips' | 'monitor'
 
-const TABS: readonly WorkbenchTab[] = ['sessions', 'files', 'monitor']
+const TABS: readonly WorkbenchTab[] = ['sessions', 'files', 'clips', 'monitor']
 
 /** 回看从场次进，所以默认打开「直播场次」 */
 export const DEFAULT_WORKBENCH_TAB: WorkbenchTab = 'sessions'

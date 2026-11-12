@@ -126,7 +126,8 @@ pub async fn open_session(
 ) -> sqlx::Result<OpenedSession> {
     let mut tx = pool.begin().await?;
     let previous: Option<(i64, Option<i64>)> = sqlx::query_as(
-        "SELECT id, ended_at FROM stream_sessions WHERE streamer_id = ? ORDER BY id DESC LIMIT 1",
+        "SELECT id, CASE WHEN deleted_at IS NULL THEN ended_at END
+         FROM stream_sessions WHERE streamer_id = ? ORDER BY id DESC LIMIT 1",
     )
     .bind(streamer_id)
     .fetch_optional(&mut *tx)
@@ -389,6 +390,7 @@ pub struct SessionListRow {
     pub streamer_name: String,
     pub title: String,
     pub started_at: i64,
+    pub file_timeline: bool,
     pub ended_at: Option<i64>,
     pub retain_until: Option<i64>,
     pub segment_count: i64,
@@ -400,7 +402,8 @@ pub struct SessionListRow {
 fn session_list_select() -> String {
     format!(
         "SELECT s.id, s.streamer_id, s.name AS streamer_name, s.title,
-            s.started_at, s.ended_at, s.retain_until,
+            COALESCE(s.started_at, s.ended_at, 0) AS started_at,
+            s.started_at IS NULL AS file_timeline, s.ended_at, s.retain_until,
             COUNT(g.id) AS segment_count,
             COALESCE(SUM(g.bytes), 0) AS bytes,
             COALESCE(MAX(COALESCE(g.end_ms, g.start_ms)), 0) AS end_ms
@@ -410,7 +413,7 @@ fn session_list_select() -> String {
 }
 
 /// 只列有时间轴的场次：老版本留下的行、开播后还没写出分段的行都没有分段，不是切片工作台的场次。
-const HAS_TIMELINE: &str = "s.started_at IS NOT NULL
+const HAS_TIMELINE: &str = "s.deleted_at IS NULL
      AND EXISTS (SELECT 1 FROM segments x WHERE x.session_id = s.id)";
 
 /// 场次列表，新的在前；`streamer_id` 为 `None` 时不过滤。返回 `(这一页, 总数)`。

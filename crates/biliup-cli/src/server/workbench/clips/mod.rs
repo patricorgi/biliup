@@ -9,6 +9,12 @@
 //!   [`thumb`]：取帧做封面。
 
 pub mod export;
+mod captions;
+pub mod edits;
+pub mod hardsubs;
+pub mod imports;
+pub mod library;
+pub mod subtitles;
 pub mod plan;
 pub mod publish;
 pub mod remux;
@@ -266,6 +272,21 @@ pub async fn list(pool: &ConnectionPool, session_id: i64) -> sqlx::Result<Vec<Cl
         .await?
         .iter()
         .map(Clip::from_row)
+        .collect()
+}
+
+/// Ready exports from every session, including sessions removed from the history.
+pub async fn list_saved(pool: &ConnectionPool) -> sqlx::Result<Vec<(Clip, String)>> {
+    let sql = format!(
+        "SELECT {COLUMNS}, (SELECT title FROM stream_sessions WHERE id = clips.session_id) AS session_title
+         FROM clips WHERE output_path IS NOT NULL AND state IN ('ready', 'published')
+         ORDER BY created_at DESC, id DESC"
+    );
+    sqlx::query(&sql)
+        .fetch_all(pool)
+        .await?
+        .iter()
+        .map(|row| Ok((Clip::from_row(row)?, row.try_get("session_title")?)))
         .collect()
 }
 

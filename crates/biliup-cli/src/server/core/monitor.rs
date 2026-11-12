@@ -677,14 +677,12 @@ impl RoomsActor {
         let platform_name = plugin.name().to_owned();
         self.all_workers.push(worker.clone());
 
-        match self.platforms.entry(platform_name) {
-            Entry::Occupied(mut entry) => {
-                entry.get_mut().push_back(worker.clone());
-                // entry.remove(); // 可以删除
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(VecDeque::from([worker.clone()])); // 插入新值
-            }
+        let queue = self.platforms.entry(platform_name).or_default();
+        if !matches!(
+            *worker.downloader_status.read().unwrap(),
+            WorkerStatus::Pause
+        ) {
+            queue.push_back(worker.clone());
         }
         debug!("Added room [{}]", worker.live_streamer.url);
         Some(plugin)
@@ -708,12 +706,17 @@ impl RoomsActor {
 
     /// 获取下一个工作器（循环遍历）
     fn next(&mut self, platform_name: &str) -> Option<Arc<Worker>> {
-        // 如果内部Vec是空的，迭代结束（虽然是循环迭代器，但空集合无法产生任何值）
-        let arc = self.platforms.get_mut(platform_name)?.pop_front()?;
-
-        *arc.downloader_status.write().unwrap() = WorkerStatus::Pending;
-
-        Some(arc)
+        let queue = self.platforms.get_mut(platform_name)?;
+        while let Some(worker) = queue.pop_front() {
+            let mut status = worker.downloader_status.write().unwrap();
+            if matches!(*status, WorkerStatus::Pause) {
+                continue;
+            }
+            *status = WorkerStatus::Pending;
+            drop(status);
+            return Some(worker);
+        }
+        None
     }
 
     /// 获取某平台所有房间的 URL（含正在检测、已弹出队列的房间）。

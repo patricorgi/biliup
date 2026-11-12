@@ -49,7 +49,7 @@ chrono = { workspace = true, features = ["serde"] }
 indexmap = { version = "2.8.0" }
 async-trait = { workspace = true }
 humantime = "2.2.0"
-axum = { version = "0.8", features = ["macros", "ws"] }
+axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
 tower-http = { version = "0.6.2", features = ["fs", "cors"] }
 # 自动切片调 OpenAI 兼容接口：chat 发 JSON，转写用 multipart 上传音频
 reqwest = { workspace = true, features = ["json", "multipart"] }
@@ -85,6 +85,7 @@ sysinfo = { version = "0.39", default-features = false, features = ["network", "
 struct-patch = "0.10.4"
 shellexpand = "3.1"
 dirs = "6.0"
+trash = "5.3.0"
 # Fleet：节点与控制面之间的 iroh QUIC 连接、join 票据与控制面内嵌的 relay，见 server/fleet/。
 # 关掉默认 feature 以去掉 UPnP / NAT-PMP 端口映射与 metrics；TLS 用 biliup 已有的 ring
 iroh = { version = "1.2", default-features = false, features = ["tls-ring"] }
@@ -92,6 +93,7 @@ iroh-tickets = "1"
 iroh-relay = { version = "1.2", default-features = false, features = ["server"] }
 # join 秘密只存摘要
 sha2 = "0.10"
+similar = { version = "2.7.0", default-features = false }
 
 # 系统状态：Windows 上查录制目录所在磁盘的容量（GetDiskFreeSpaceExW）
 [target.'cfg(windows)'.dependencies]

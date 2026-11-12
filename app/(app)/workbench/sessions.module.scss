@@ -18,3 +18,33 @@
 .fileReplay {
   margin-left: 12px;
 }
+
+.actions,
+.file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.actions {
+  white-space: nowrap;
+}
+
+.files {
+  padding: 4px 8px;
+  font-size: 13px;
+  color: var(--semi-color-text-1);
+}
+
+.file {
+  flex-wrap: wrap;
+  padding-left: 24px;
+  font-variant-numeric: tabular-nums;
+}
+
+.trashFiles {
+  max-height: 240px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  padding-left: 24px;
+}

@@ -5,6 +5,7 @@ use crate::server::api::auto_clip::{
 use crate::server::api::bilibili_endpoints::{
     archive_pre_endpoint, get_user_archives_endpoint, get_user_profile_endpoint,
 };
+use crate::server::api::clip_library;
 use crate::server::api::clip_publish::{
     cover_route, get_session_thumb, list_publish_jobs, preview_publish, publish_batch,
     publish_clip, remove_publish, resume_publish, retry_publish,
@@ -15,14 +16,16 @@ use crate::server::api::clip_suggestions::{
 use crate::server::api::clips::{
     create_clip, delete_clip, download_clip, export_clip, get_clip, list_clips, update_clip,
 };
+use crate::server::api::cover_generation;
 use crate::server::api::danmaku_density::get_danmaku_density;
 use crate::server::api::endpoints::{
     add_upload_streamer_endpoint, add_user_endpoint, delete_streamers_endpoint,
-    delete_template_endpoint, delete_user_endpoint, get_configuration, get_qrcode, get_status,
-    get_streamer_info, get_streamer_info_files, get_streamers_endpoint, get_tools,
-    get_upload_streamer_endpoint, get_upload_streamers_endpoint, get_users_endpoint, get_videos,
-    login_by_qrcode, pause_streamers_endpoint, post_streamers_endpoint, post_uploads,
-    put_configuration, put_streamers_endpoint,
+    delete_template_endpoint, delete_user_endpoint, get_configuration, get_page_upload, get_qrcode,
+    get_status, get_streamer_info, get_streamer_info_files, get_streamers_endpoint, get_tools,
+    get_upload_joins, get_upload_streamer_endpoint, get_upload_streamers_endpoint,
+    get_users_endpoint, get_videos, login_by_qrcode, pause_streamers_endpoint,
+    post_streamers_endpoint, post_upload_files, post_uploads, put_configuration,
+    put_streamers_endpoint,
 };
 use crate::server::api::live_media::{get_live_avatar, get_live_cover};
 use crate::server::api::live_preview::{
@@ -30,6 +33,9 @@ use crate::server::api::live_preview::{
 };
 use crate::server::api::live_rates::{get_live_rates, ws_live_rates};
 use crate::server::api::markers::{create_marker, delete_marker, list_markers, update_marker};
+use crate::server::api::recording_trash::{
+    get_session_recordings, trash_session_recordings, trash_video,
+};
 use crate::server::api::session_retention::patch_session;
 use crate::server::api::sessions::{
     get_session, get_session_keyframes, get_session_media, list_sessions,
@@ -38,6 +44,7 @@ use crate::server::api::system_stats::get_system_stats;
 use crate::server::infrastructure::service_register::ServiceRegister;
 use axum::Router;
 use axum::body::Body;
+use axum::extract::DefaultBodyLimit;
 use axum::http::Request;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -45,7 +52,8 @@ use axum::routing::{delete, get, patch, post, put};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
-const ALLOWED_MEDIA_EXTENSIONS: &[&str] = &["mp4", "flv", "3gp", "webm", "mkv", "ts"];
+pub(crate) const ALLOWED_MEDIA_EXTENSIONS: &[&str] = &["mp4", "flv", "3gp", "webm", "mkv", "ts"];
+pub(crate) const RECORDINGS_DIR: &str = "recordings";
 pub(crate) const ALLOWED_LOG_FILES: &[&str] = &["ds_update.log", "download.log", "upload.log"];
 /// 创建应用程序路由
 pub fn router(service_register: ServiceRegister) -> Router<()> {
@@ -84,6 +92,11 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
         // PATCH 是「保留这场」：改场次的 retain_until
         .route("/v1/sessions/{id}", get(get_session).patch(patch_session))
         .route("/v1/sessions/{id}/keyframes", get(get_session_keyframes))
+        .route("/v1/sessions/{id}/transcript", get(crate::server::api::transcripts::get).post(crate::server::api::transcripts::start))
+        .route(
+            "/v1/sessions/{id}/recordings",
+            get(get_session_recordings).delete(trash_session_recordings),
+        )
         .route("/v1/sessions/{id}/media", get(get_session_media))
         // 切片工作台：看直播时打的标记（只按场次 id、标记 id 寻址）
         .route(
@@ -105,6 +118,40 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
         .route("/v1/clips/{cid}", get(get_clip))
         .route("/v1/clips/{cid}/export", post(export_clip))
         .route("/v1/clips/{cid}/download", get(download_clip))
+        .route(
+            "/v1/clip-library",
+            get(clip_library::list).delete(clip_library::trash_clips),
+        )
+        .route("/v1/clip-library/import", post(clip_library::import))
+        .route(
+            "/v1/clip-library/imported/{cid}/download",
+            get(clip_library::imported_download),
+        )
+        .route("/v1/clip-library/preview/{cid}", get(clip_library::preview))
+        .route("/v1/clip-library/trim/{cid}", post(clip_library::trim))
+        .route(
+            "/v1/clip-library/restore/{cid}",
+            post(clip_library::restore_trim),
+        )
+        .route("/v1/clip-library/join", post(clip_library::join))
+        .route(
+            "/v1/clip-library/output/{id}",
+            get(clip_library::output).delete(clip_library::trash_join),
+        )
+        .route(
+            "/v1/clip-library/output/{id}/subtitles",
+            get(clip_library::download_subtitles).post(clip_library::generate_subtitles),
+        )
+        .route(
+            "/v1/clip-library/output/{id}/subtitles/edit",
+            get(clip_library::subtitle_draft).put(clip_library::edit_subtitles),
+        )
+        .route(
+            "/v1/clip-library/output/{id}/hardsubs",
+            get(clip_library::download_hardsubs)
+                .post(clip_library::generate_hardsubs)
+                .delete(clip_library::cancel_hardsubs),
+        )
         // 切片工作台：发布（导出 → 上传 → 投稿；一律转载，来源默认直播间地址）
         .route("/v1/clips/{cid}/publish", post(publish_clip))
         .route("/v1/clips/{cid}/cover", cover_route())
@@ -173,10 +220,22 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
         .route("/v1/get_qrcode", get(get_qrcode)) // 获取二维码
         .route("/v1/login_by_qrcode", post(login_by_qrcode)) // 二维码登录
         // 视频文件管理路由
-        .route("/v1/videos", get(get_videos)) // 获取视频列表
+        .route("/v1/videos", get(get_videos).delete(trash_video))
         .route("/v1/status", get(get_status))
         .route("/v1/tools", get(get_tools)) // ffmpeg 是否可用、版本与许可
         .route("/v1/uploads", post(post_uploads))
+        .route("/v1/uploads/joins", get(get_upload_joins))
+        .route("/v1/uploads/jobs/{id}", get(get_page_upload))
+        .route(
+            "/v1/uploads/cover-generation",
+            get(cover_generation::status)
+                .post(cover_generation::generate)
+                .layer(DefaultBodyLimit::max(cover_generation::MAX_REQUEST_BYTES)),
+        )
+        .route(
+            "/v1/uploads/files",
+            post(post_upload_files).layer(DefaultBodyLimit::disable()),
+        )
         .route("/static/{path}", get(using_serve_file_from_a_route))
         .with_state(service_register) // 注入服务注册器状态
 }
@@ -210,8 +269,11 @@ fn resolve_static_path(
 ) -> Result<std::path::PathBuf, StaticPathError> {
     use std::path::{Component, Path};
 
-    // The endpoint intentionally accepts an opaque basename, not a filesystem
-    // path.  Reject both separator styles so the same rule holds on every OS.
+    if let Some((RECORDINGS_DIR, _)) = requested.split_once('/') {
+        return resolve_recording_path(root, requested);
+    }
+
+    // 除录制归档目录外，静态文件只按文件名访问。
     if requested.is_empty() || requested.contains('/') || requested.contains('\\') {
         return Err(StaticPathError::Invalid);
     }
@@ -273,9 +335,38 @@ pub(crate) fn resolve_media_path(
     Ok(canonical)
 }
 
+/// 已完成的录播仅位于工作目录或其 recordings 子目录。拒绝符号链接，
+/// 避免删除时把同名链接指向的另一个文件移入废纸篓。
+pub(crate) fn resolve_recording_path(
+    root: &std::path::Path,
+    requested: &str,
+) -> Result<std::path::PathBuf, StaticPathError> {
+    let root = root.canonicalize().map_err(|_| StaticPathError::NotFound)?;
+    let (directory, name) = match requested.split_once('/') {
+        Some((RECORDINGS_DIR, name)) => {
+            let directory = root.join(RECORDINGS_DIR);
+            let metadata =
+                std::fs::symlink_metadata(&directory).map_err(|_| StaticPathError::NotFound)?;
+            if !metadata.is_dir() {
+                return Err(StaticPathError::Invalid);
+            }
+            (directory, name)
+        }
+        Some(_) => return Err(StaticPathError::Invalid),
+        None => (root, requested),
+    };
+    let resolved = resolve_media_path(&directory, name)?;
+    let candidate = directory.join(name);
+    let metadata = std::fs::symlink_metadata(&candidate).map_err(|_| StaticPathError::NotFound)?;
+    if !metadata.is_file() || resolved != candidate {
+        return Err(StaticPathError::Invalid);
+    }
+    Ok(candidate)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{StaticPathError, resolve_static_path};
+    use super::{StaticPathError, resolve_recording_path, resolve_static_path};
     use std::fs;
 
     #[test]
@@ -290,11 +381,11 @@ mod tests {
 
         assert_eq!(
             resolve_static_path(root.path(), "recording.mp4").unwrap(),
-            video
+            video.canonicalize().unwrap()
         );
         assert_eq!(
             resolve_static_path(root.path(), "ds_update.log").unwrap(),
-            log
+            log.canonicalize().unwrap()
         );
         assert_eq!(
             resolve_static_path(root.path(), "cookies.json"),
@@ -317,6 +408,47 @@ mod tests {
                 Err(StaticPathError::Invalid)
             );
         }
+    }
+
+    #[test]
+    fn archived_recordings_can_be_played_and_trashed_by_exact_name() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("recordings");
+        fs::create_dir(&archive).unwrap();
+        let video = archive.join("直播 #1.flv");
+        fs::write(&video, b"video").unwrap();
+
+        let name = "recordings/直播 #1.flv";
+        let video = video.canonicalize().unwrap();
+        assert_eq!(resolve_recording_path(root.path(), name).unwrap(), video);
+        assert_eq!(resolve_static_path(root.path(), name).unwrap(), video);
+        for invalid in [
+            "recordings/../video.flv",
+            "recordings/subdir/video.flv",
+            "clips/export.mp4",
+            "recordings/live.flv.part",
+            "recordings/comments.xml",
+        ] {
+            assert_eq!(
+                resolve_recording_path(root.path(), invalid),
+                Err(StaticPathError::Invalid)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trash_rejects_symlink_even_when_its_target_is_another_recording() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let video = root.path().join("original.flv");
+        fs::write(&video, b"video").unwrap();
+        symlink(video, root.path().join("link.flv")).unwrap();
+        assert_eq!(
+            resolve_recording_path(root.path(), "link.flv"),
+            Err(StaticPathError::Invalid)
+        );
     }
 
     #[cfg(unix)]

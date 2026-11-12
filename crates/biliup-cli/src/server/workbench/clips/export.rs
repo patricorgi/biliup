@@ -181,6 +181,10 @@ impl ClipExports {
         }
     }
 
+    pub fn library_dir(&self) -> PathBuf {
+        self.root.join("managed")
+    }
+
     pub fn dir(&self, session_id: i64) -> PathBuf {
         self.root.join(session_id.to_string())
     }
@@ -447,6 +451,11 @@ impl ClipExports {
     }
 
     /// 下载用的 MP4：产物本来就是 MP4 直接给；否则用 ffmpeg `-c copy` 转封装一份缓存在旁边。
+    pub async fn lock_remux(&self, id: i64) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = self.remuxing.lock().await.entry(id).or_default().clone();
+        gate.lock_owned().await
+    }
+
     pub async fn mp4(&self, clip: &Clip) -> Result<PathBuf, DownloadError> {
         let source = clip
             .output_path
@@ -464,14 +473,10 @@ impl ClipExports {
             return Ok(source);
         }
         let target = source.with_extension("mp4");
-        let gate = self
-            .remuxing
-            .lock()
-            .await
-            .entry(clip.id)
-            .or_default()
-            .clone();
-        let _guard = gate.lock().await;
+        let _guard = self.lock_remux(clip.id).await;
+        if !tokio::fs::try_exists(&source).await.unwrap_or(false) {
+            return Err(DownloadError::Missing);
+        }
         if tokio::fs::try_exists(&target).await.unwrap_or(false) {
             return Ok(target);
         }

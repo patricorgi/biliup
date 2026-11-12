@@ -334,6 +334,7 @@ pub async fn update_clip(
     Path((id, cid)): Path<(i64, i64)>,
     Json(body): Json<UpdateClip>,
 ) -> Response {
+    let _guard = clips::edits::MUTATION.lock().await;
     let title = match body.title.as_deref().map(check_title).transpose() {
         Ok(title) => title,
         Err(message) => return bad_request(message),
@@ -415,6 +416,7 @@ pub async fn delete_clip(
     State(publisher): State<Arc<ClipPublisher>>,
     Path((id, cid)): Path<(i64, i64)>,
 ) -> Response {
+    let _guard = clips::edits::MUTATION.lock().await;
     if publisher.state_of(cid).is_some() {
         return conflict("这个切片在发布队列里，先把它移出队列再删");
     }
@@ -443,6 +445,7 @@ pub async fn export_clip(
     Path(cid): Path<i64>,
     Json(body): Json<ExportClip>,
 ) -> Response {
+    let _guard = clips::edits::MUTATION.lock().await;
     match clips::begin_export(&pool, cid, body.mode, recorder::now_ms()).await {
         Ok(Some(clip)) => {
             exports.start(clip.clone());
@@ -477,23 +480,53 @@ pub struct DownloadQuery {
 }
 
 /// 下载时的文件名：标题（去掉文件名里不能用的字符）或 `切片-<id>`，加扩展名。
-fn download_name(clip: &Clip, extension: &str) -> String {
-    let title: String = clip
-        .title
-        .chars()
-        .map(|c| {
-            if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect();
-    let title = title.trim().trim_matches('.');
+fn filename_component(value: &str) -> String {
+    // Limit by UTF-8 bytes so two titles, the timestamps, and the extension fit in a filename.
+    let mut cleaned = String::new();
+    for c in value.trim().chars() {
+        let c = if c.is_control()
+            || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        {
+            '_'
+        } else {
+            c
+        };
+        if cleaned.len() + c.len_utf8() > 96 {
+            break;
+        }
+        cleaned.push(c);
+    }
+    cleaned
+        .trim_matches(|c: char| c.is_whitespace() || c == '.')
+        .to_owned()
+}
+
+fn filename_time(ms: i64) -> String {
+    let seconds = ms / 1_000;
+    format!(
+        "{:02}-{:02}-{:02}.{:03}",
+        seconds / 3_600,
+        seconds / 60 % 60,
+        seconds % 60,
+        ms % 1_000,
+    )
+}
+
+fn download_name(clip: &Clip, session_title: &str, streamer_name: &str, extension: &str) -> String {
+    let mut session = filename_component(session_title);
+    if session.is_empty() {
+        session = filename_component(streamer_name);
+    }
+    if session.is_empty() {
+        session = format!("直播场次 {}", clip.session_id);
+    }
+    let title = filename_component(&clip.title);
+    let start = filename_time(clip.in_ms);
+    let end = filename_time(clip.out_ms);
     if title.is_empty() {
-        format!("切片-{}.{extension}", clip.id)
+        format!("{session} - {start} - {end}.{extension}")
     } else {
-        format!("{title}.{extension}")
+        format!("{title} - {session} - {start} - {end}.{extension}")
     }
 }
 
@@ -530,7 +563,16 @@ pub async fn download_clip(
         .and_then(|e| e.to_str())
         .unwrap_or("bin")
         .to_ascii_lowercase();
-    let name = download_name(&clip, &extension);
+    let (session_title, streamer_name): (String, String) =
+        match sqlx::query_as("SELECT title, name FROM stream_sessions WHERE id = ?")
+            .bind(clip.session_id)
+            .fetch_one(&pool)
+            .await
+        {
+            Ok(names) => names,
+            Err(error) => return internal(error),
+        };
+    let name = download_name(&clip, &session_title, &streamer_name, &extension);
     let disposition = format!(
         "attachment; filename=\"clip-{cid}.{extension}\"; filename*=UTF-8''{}",
         urlencoding::encode(&name)

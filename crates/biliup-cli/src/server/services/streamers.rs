@@ -1,7 +1,7 @@
 use crate::server::core::download_manager::DownloadManager;
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
-use crate::server::infrastructure::context::{Stage, WorkerStatus};
+use crate::server::infrastructure::context::{Stage, Worker, WorkerStatus};
 use crate::server::infrastructure::models::live_streamer::{InsertLiveStreamer, LiveStreamer};
 use crate::server::infrastructure::repositories::{del_streamer, get_upload_config};
 use crate::server::infrastructure::service_register::ServiceRegister;
@@ -9,11 +9,14 @@ use error_stack::{Report, ResultExt};
 use ormlite::{Insert, Model};
 use tracing::info;
 
+static RECORDING_SETTINGS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// 新增主播失败的原因
 #[derive(Debug)]
 pub enum AddStreamerError {
     /// 没有插件支持这个直播间地址。主播已经写入数据库，只是没有加入监控
     UnsupportedUrl,
+    AlreadyExists,
     /// 落库或调度出错
     Internal(Report<AppError>),
 }
@@ -29,17 +32,46 @@ pub async fn add_streamer(
     services: &ServiceRegister,
     streamer: InsertLiveStreamer,
 ) -> Result<LiveStreamer, AddStreamerError> {
+    add_streamer_with_recording_state(services, streamer, false).await
+}
+
+pub async fn add_streamer_with_recording_state(
+    services: &ServiceRegister,
+    streamer: InsertLiveStreamer,
+    paused: bool,
+) -> Result<LiveStreamer, AddStreamerError> {
     let url = &streamer.url.clone();
-    let live_streamers = streamer
-        .insert(&services.pool)
+    let _settings = RECORDING_SETTINGS.lock().await;
+    let mut tx = services
+        .pool
+        .begin()
         .await
         .change_context(AppError::Unknown)?;
-    let upload_config = get_upload_config(&services.pool, live_streamers.id).await?;
-    let Some(_) = services
-        .managers
-        .add_room(services.worker(live_streamers.clone(), upload_config))
+    if paused {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM livestreamers WHERE url = ?)")
+                .bind(url)
+                .fetch_one(&mut *tx)
+                .await
+                .change_context(AppError::Unknown)?;
+        if exists {
+            return Err(AddStreamerError::AlreadyExists);
+        }
+    }
+    let live_streamers = streamer
+        .insert(&mut *tx)
         .await
-    else {
+        .change_context(AppError::Unknown)?;
+    if paused {
+        sqlx::query("UPDATE livestreamers SET recording_paused = 1 WHERE id = ?")
+            .bind(live_streamers.id)
+            .execute(&mut *tx)
+            .await
+            .change_context(AppError::Unknown)?;
+    }
+    tx.commit().await.change_context(AppError::Unknown)?;
+    let worker = configured_worker(services, live_streamers.clone()).await?;
+    let Some(_) = services.managers.add_room(worker).await else {
         info!("not supported url: {}", url);
         return Err(AddStreamerError::UnsupportedUrl);
     };
@@ -48,11 +80,57 @@ pub async fn add_streamer(
     Ok(live_streamers)
 }
 
+pub(crate) async fn configured_worker(
+    services: &ServiceRegister,
+    streamer: LiveStreamer,
+) -> AppResult<Worker> {
+    let id = streamer.id;
+    let paused: Option<bool> =
+        sqlx::query_scalar("SELECT recording_paused FROM livestreamers WHERE id = ?")
+            .bind(id)
+            .fetch_one(&services.pool)
+            .await
+            .change_context(AppError::Unknown)?;
+    let upload_config = get_upload_config(&services.pool, id).await?;
+    let mut worker = services.worker(streamer, upload_config);
+    if paused == Some(true) {
+        *worker.downloader_status.get_mut().unwrap() = WorkerStatus::Pause;
+    }
+    Ok(worker)
+}
+
+pub async fn set_recording_pause(
+    services: &ServiceRegister,
+    id: i64,
+    desired_pause: Option<bool>,
+) -> AppResult<()> {
+    let _settings = RECORDING_SETTINGS.lock().await;
+    let Some(worker) = services.managers.get_room_by_id(id).await else {
+        return Ok(());
+    };
+    let paused = matches!(
+        *worker.downloader_status.read().unwrap(),
+        WorkerStatus::Pause
+    );
+    let desired_pause = desired_pause.unwrap_or(!paused);
+    sqlx::query("UPDATE livestreamers SET recording_paused = ? WHERE id = ?")
+        .bind(desired_pause)
+        .bind(id)
+        .execute(&services.pool)
+        .await
+        .change_context(AppError::Unknown)?;
+    if paused != desired_pause {
+        toggle_pause(&services.managers, id).await;
+    }
+    Ok(())
+}
+
 /// 整体覆盖保存主播，并用新设置重建它的监控
 pub async fn update_streamer(
     services: &ServiceRegister,
     streamer: LiveStreamer,
 ) -> AppResult<LiveStreamer> {
+    let _settings = RECORDING_SETTINGS.lock().await;
     let streamer = streamer
         .update_all_fields(&services.pool)
         .await
@@ -61,11 +139,11 @@ pub async fn update_streamer(
     let id = streamer.id;
     services.managers.del_room(id).await;
 
-    let upload_config = get_upload_config(&services.pool, id).await?;
+    let worker = configured_worker(services, streamer.clone()).await?;
 
     services
         .managers
-        .add_room(services.worker(streamer.clone(), upload_config))
+        .add_room(worker)
         .await
         .ok_or(AppError::Unknown)?;
 

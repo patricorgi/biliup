@@ -14,6 +14,7 @@ pub mod clips;
 pub mod dvr;
 pub mod index;
 pub mod live;
+pub mod legacy;
 pub mod markers;
 pub mod recorder;
 pub mod retention;

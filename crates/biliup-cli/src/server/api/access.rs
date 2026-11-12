@@ -228,9 +228,14 @@ mod tests {
         ("GET", "/v1/get_qrcode"),
         ("POST", "/v1/login_by_qrcode"),
         ("GET", "/v1/videos"),
+        ("DELETE", "/v1/videos"),
+        ("GET", "/v1/sessions/1/recordings"),
+        ("DELETE", "/v1/sessions/1/recordings"),
         ("GET", "/v1/status"),
         ("GET", "/v1/tools"),
         ("POST", "/v1/uploads"),
+        ("POST", "/v1/uploads/files"),
+        ("GET", "/v1/uploads/joins"),
         ("GET", "/static/ds_update.log"),
         ("GET", "/static/a.flv"),
         ("GET", "/v1/ws/logs"),
@@ -272,6 +277,7 @@ mod tests {
             | ("GET", "/v1/upload/streamers")
             | ("GET", "/v1/upload/streamers/1")
             | ("GET", "/v1/videos")
+            | ("GET", "/v1/sessions/1/recordings")
             | ("GET", "/v1/status")
             | ("GET", "/v1/tools")
             | ("GET", "/static/ds_update.log")
@@ -288,6 +294,8 @@ mod tests {
             | ("GET", "/v1/users/1")
             | ("GET", "/bili/archive/pre")
             | ("POST", "/v1/uploads")
+            | ("POST", "/v1/uploads/files")
+            | ("GET", "/v1/uploads/joins")
             | ("POST", "/v1/sessions/1/markers")
             | ("PATCH", "/v1/sessions/1/markers/1")
             | ("DELETE", "/v1/sessions/1/markers/1")
@@ -326,6 +334,7 @@ mod tests {
             .route("/v1/sessions/{id}", ok())
             .route("/v1/sessions/{id}/keyframes", ok())
             .route("/v1/sessions/{id}/media", ok())
+            .route("/v1/sessions/{id}/recordings", any())
             .route(
                 "/v1/sessions/{id}/markers",
                 get(|| async { StatusCode::OK }).post(|| async { StatusCode::OK }),
@@ -358,10 +367,15 @@ mod tests {
             .route("/bili/archive/pre", ok())
             .route("/v1/get_qrcode", ok())
             .route("/v1/login_by_qrcode", post(|| async { StatusCode::OK }))
-            .route("/v1/videos", ok())
+            .route(
+                "/v1/videos",
+                get(|| async { StatusCode::OK }).delete(|| async { StatusCode::OK }),
+            )
             .route("/v1/status", ok())
             .route("/v1/tools", ok())
             .route("/v1/uploads", post(|| async { StatusCode::OK }))
+            .route("/v1/uploads/files", post(|| async { StatusCode::OK }))
+            .route("/v1/uploads/joins", ok())
             .route("/static/{path}", ok())
             .route("/v1/ws/logs", ok())
             .route("/v1/web-users", any())

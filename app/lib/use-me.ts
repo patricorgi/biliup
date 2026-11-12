@@ -20,6 +20,8 @@ export type Permission =
   | 'config.edit'
   | 'log.view'
   | 'file.view'
+  | 'file.delete'
+  | 'file.import'
   | 'user.manage'
   | 'clip.edit'
   | 'node.manage'
@@ -47,6 +49,8 @@ export const PERMISSION_LABELS: Record<Permission, string> = {
   'config.edit': '修改配置',
   'log.view': '查看日志',
   'file.view': '查看录播文件',
+  'file.import': '导入本机切片',
+  'file.delete': '将录播移入废纸篓',
   'user.manage': '管理用户',
   'clip.edit': '打标记、保留场次',
   'node.manage': '管理节点',

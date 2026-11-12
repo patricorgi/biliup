@@ -390,6 +390,9 @@ pub async fn publish_clip(
     Path(cid): Path<i64>,
     Json(body): Json<PublishClip>,
 ) -> Response {
+    let _guard = crate::server::workbench::clips::edits::MUTATION
+        .lock()
+        .await;
     if let Err(message) = body.settings().validate() {
         return bad_request(message);
     }
@@ -432,6 +435,9 @@ pub async fn publish_batch(
     State(publisher): State<Arc<ClipPublisher>>,
     Json(body): Json<PublishBatch>,
 ) -> Response {
+    let _guard = crate::server::workbench::clips::edits::MUTATION
+        .lock()
+        .await;
     let clips = match load_clips(&pool, &body.clip_ids).await {
         Ok(clips) => clips,
         Err(rejection) => return rejection.into_response(),

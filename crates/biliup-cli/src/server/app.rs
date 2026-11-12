@@ -89,10 +89,14 @@ impl ApplicationController {
                 // CORS配置 - 跨域资源共享
                 // 详见 https://docs.rs/tower-http/latest/tower_http/cors/index.html
                 // 注意：对于某些请求类型（如POST application/json），
-                // 需要添加 ".allow_headers([http::header::CONTENT_TYPE])"
+                // 需要添加 ".allow_headers([http::header::CONTENT_TYPE, http::HeaderName::from_static("x-biliup-upload")])"
                 // 参考：https://github.com/tokio-rs/axum/issues/849
                 CorsLayer::new()
-                    .allow_headers([http::header::CONTENT_TYPE])
+                    .allow_headers([
+                        http::header::CONTENT_TYPE,
+                        http::HeaderName::from_static("x-biliup-upload"),
+                        http::HeaderName::from_static("x-biliup-cover"),
+                    ])
                     // 录像回看要读起播关键帧的场次时间；开发时前端（:3000）和后端不同源
                     .expose_headers([
                         http::HeaderName::from_static("x-dvr-start-ms"),

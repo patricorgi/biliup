@@ -6,12 +6,14 @@ pub mod auth;
 pub mod auto_clip;
 /// B站API端点
 pub mod bilibili_endpoints;
+/// 切片工作台的切片与导出
+pub mod clip_library;
 /// 切片工作台的切片发布（上传投稿队列、取帧、封面）
 pub mod clip_publish;
 /// 自动切片的候选：列表、接受、丢弃
 pub mod clip_suggestions;
-/// 切片工作台的切片与导出
 pub mod clips;
+pub mod cover_generation;
 /// 弹幕密度曲线（回看页用）
 pub mod danmaku_density;
 /// 通用API端点
@@ -37,6 +39,7 @@ pub mod redact;
 /// 「保留这场」：改场次的保留期
 pub mod session_retention;
 pub mod sessions;
+pub mod transcripts;
 /// 单页应用静态文件处理
 pub mod spa;
 /// 控制台首页的系统状态（CPU / 内存 / 磁盘 / 网速）
@@ -44,3 +47,5 @@ pub mod system_stats;
 /// Web 用户管理与 /v1/me
 pub mod web_users;
 pub mod ws;
+
+pub mod recording_trash;
